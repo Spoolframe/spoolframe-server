@@ -151,6 +151,7 @@ pub(crate) async fn playback_ownership(
         display: None,
         capabilities: None,
         onward_share: None,
+        source: None,
     };
     let (handle, size) = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted {

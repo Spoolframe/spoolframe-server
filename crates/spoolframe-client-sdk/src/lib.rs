@@ -143,6 +143,10 @@ pub use phone_sign_in::{
 };
 pub use spoolframe_protocol::invite::InviteLinkKind;
 pub use spoolframe_protocol::pairing::PairedServer;
+pub use spoolframe_protocol::recently_played::{
+    self, PlaySource, RecentCard, RecentMoviesMode, RecentMusicMode, RecentShowsMode,
+    RecentlyPlayedPreferences,
+};
 // Portable identities and their device credentials.
 pub use federation::{DIRECT_DIAL, LibrariesChanged, RemoteDownload, RemoteMode, RemotePlayback};
 pub use likes::{LikeCache, Pending};

@@ -92,6 +92,37 @@
 - Added, FFI: `SpoolClient.start_phone_sign_in(name, relay)`
   (`SpoolPhoneSignIn`) and `SpoolClient.scan_phone_sign_in(link)`
   (`SpoolSignInOffer`, `SpoolSignInChoice`, `SignInOfferResult`).
+- Added, protocol and server: Home's "Recently played" is one row of
+  every kind, and each user picks how each kind shows in it. Feature
+  `spoolframe:recently-played-row` brings `recently_played_row { limit
+  }`, answered with cards newest first, each once (`RecentCard`:
+  `movie`, `show`, `season`, `episode`, `album`, `playlist` or
+  `track`), and `recently_played_preferences` and
+  `set_recently_played_preferences`, with three fields: `music` is
+  `sources` (the default), `tracks`, `albums` or `hidden`; `shows` is
+  `show`, `season`, `episode` (the default) or `hidden`; `movies` is
+  `movie` (the default) or `hidden`. A hidden kind leaves the row, and
+  with all three hidden the answer is empty and the app shows no row.
+  The setting changes only what the row shows: every play is still
+  recorded and counted. See PROTOCOL.md's The recently played row.
+- Added, protocol and server: by source, a music play from a playlist
+  shows the playlist, one from an album the album, and a track queued by
+  hand the track. `start_playback` and each offline play take an
+  optional `source` (`PlaySource`: `album { id }`, `playlist { id }` or
+  `queued`), kept with the play; it needs no feature. A play from a
+  playlist the user no longer sees shows its album, and so does a play
+  with no source, every play from before this. The web profile page's
+  Playback card has the setting.
+- Added, SDK: `PlaybackOptions::source`, `PlaylistCursor::source()`,
+  `PlayQueue::current_source()` and `set_context_playlist`, and
+  `Downloads::record_play_from`, so each way a track starts says where.
+  `On<RecentlyPlayedRow>` has `recently_played_row(limit)`,
+  `recently_played_preferences()` and
+  `set_recently_played_preferences(preferences)`; setting them clears
+  Home from the catalog cache. `recently_played` and
+  `recently_played_albums` are unchanged. FFI: an optional `source` on
+  `play`, `open_playback` and `record_offline_play`, and
+  `SpoolSession.recently_played_row()` (`RecentlyPlayedRowApi`).
 
 ## 0.17.4 (2026-11-15)
 

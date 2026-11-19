@@ -617,6 +617,7 @@ async fn start_playback(client: &TestClient, session: &SessionId) -> PlaybackHan
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;

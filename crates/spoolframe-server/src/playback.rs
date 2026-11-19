@@ -685,6 +685,8 @@ pub struct Played {
     pub credits: Option<Duration>,
     /// Where in it the playback starts.
     pub from: Duration,
+    /// Where its client started it, for a track (`StartPlayback.source`).
+    pub source: Option<spoolframe_protocol::recently_played::PlaySource>,
 }
 
 /// What follows each playback through its life, as play history does
@@ -2190,6 +2192,7 @@ pub(crate) mod tests {
             duration: Some(Duration::from_secs(10)),
             credits: None,
             from: Duration::ZERO,
+            source: None,
         }
     }
 

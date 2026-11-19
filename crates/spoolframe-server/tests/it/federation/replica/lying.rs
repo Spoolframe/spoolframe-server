@@ -343,6 +343,7 @@ async fn bob_plays(sb: &TestServer, features: &[&str]) -> (TestClient, SessionId
         display: None,
         capabilities: None,
         onward_share: None,
+        source: None,
     };
     let handle = match device.call(Some(&bob), start).await {
         Response::Ok(Reply::PlaybackStarted { handle, .. }) => handle,

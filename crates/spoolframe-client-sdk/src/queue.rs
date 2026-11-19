@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use spoolframe_protocol::playlists::Repeat;
 use spoolframe_types::Album;
 
+use crate::PlaySource;
+
 /// How far into an item Previous starts it again rather than going back.
 pub const RESTART_AFTER: Duration = Duration::from_secs(3);
 
@@ -90,6 +92,10 @@ pub struct PlayQueue<T> {
     context: Vec<T>,
     /// The album the context is, if it is one.
     album: Option<Album>,
+    /// The playlist the context is, if it is one
+    /// ([`PlayQueue::set_context_playlist`]).
+    #[serde(default)]
+    playlist: Option<String>,
     /// The context's play order, as positions in `context`.
     order: Vec<usize>,
     /// Where the context is in `order`: the context item playing, or the
@@ -123,6 +129,7 @@ impl<T: Clone> PlayQueue<T> {
         let mut queue = Self {
             context: Vec::new(),
             album: None,
+            playlist: None,
             order: Vec::new(),
             at: None,
             next_id: queued.iter().map(|q| q.id).max().unwrap_or(0),
@@ -144,6 +151,7 @@ impl<T: Clone> PlayQueue<T> {
         self.order = (0..context.len()).collect();
         self.context = context;
         self.album = album;
+        self.playlist = None;
         self.shuffle = false;
         self.removed.clear();
         self.history.clear();
@@ -194,6 +202,30 @@ impl<T: Clone> PlayQueue<T> {
     /// The context's album, for "Next from: <album>".
     pub fn album(&self) -> Option<&Album> {
         self.album.as_ref()
+    }
+
+    /// Names the context playlist `id`, or none: set after
+    /// [`Self::set_context`] (or [`Self::new`]), which forgets it, for
+    /// [`Self::current_source`].
+    pub fn set_context_playlist(&mut self, id: Option<String>) {
+        self.playlist = id;
+    }
+
+    /// Where what plays was started, for
+    /// [`crate::PlaybackOptions::source`]: [`PlaySource::Queued`] for an
+    /// item added by hand; else the context's playlist, or its album; or
+    /// `None` for a context that is neither, or when nothing plays.
+    pub fn current_source(&self) -> Option<PlaySource> {
+        match self.now.as_ref()? {
+            Now::Queued(_) => Some(PlaySource::Queued),
+            Now::Context => match (&self.playlist, &self.album) {
+                (Some(id), _) => Some(PlaySource::Playlist { id: id.clone() }),
+                (None, Some(album)) => Some(PlaySource::Album {
+                    id: album.id.clone(),
+                }),
+                (None, None) => None,
+            },
+        }
     }
 
     /// Whether what plays was taken from the queue.
@@ -611,6 +643,53 @@ mod tests {
     /// not the identity.
     fn first(_: usize) -> usize {
         0
+    }
+
+    #[test]
+    fn an_album_context_s_item_is_from_the_album() {
+        let low_tide = album("Low Tide");
+        let queue = Queue::new(songs("a b"), 0, Some(low_tide.clone()), Vec::new());
+        assert_eq!(
+            queue.current_source(),
+            Some(PlaySource::Album { id: low_tide.id })
+        );
+    }
+
+    #[test]
+    fn a_playlist_context_s_item_is_from_the_playlist() {
+        let mut queue = Queue::new(songs("a b"), 0, Some(album("Low Tide")), Vec::new());
+        queue.set_context_playlist(Some("p1".into()));
+        assert_eq!(
+            queue.current_source(),
+            Some(PlaySource::Playlist { id: "p1".into() })
+        );
+    }
+
+    #[test]
+    fn an_item_added_by_hand_is_queued_whatever_the_context() {
+        let mut queue = Queue::new(songs("a"), 0, Some(album("Low Tide")), Vec::new());
+        queue.set_context_playlist(Some("p1".into()));
+        queue.add(songs("x"), Some(album("Glasshouse")));
+        queue.next(false);
+        assert_eq!(queue.current_source(), Some(PlaySource::Queued));
+    }
+
+    #[test]
+    fn a_new_context_forgets_the_playlist() {
+        let mut queue = Queue::new(songs("a"), 0, None, Vec::new());
+        queue.set_context_playlist(Some("p1".into()));
+        queue.set_context(songs("b"), 0, None);
+        assert_eq!(queue.current_source(), None);
+    }
+
+    #[test]
+    fn a_queue_saved_before_sources_loads_with_none() {
+        let mut queue = Queue::new(songs("a"), 0, None, Vec::new());
+        queue.set_context_playlist(Some("p1".into()));
+        let mut saved = serde_json::to_value(&queue).unwrap();
+        saved.as_object_mut().unwrap().remove("playlist");
+        let loaded: Queue = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.current_source(), None);
     }
 
     #[test]

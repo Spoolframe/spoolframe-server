@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 
-use spoolframe_types::MediaKind;
+use spoolframe_protocol::recently_played::PlaySource;
+use spoolframe_types::{
+    MediaKind, RecentMoviesMode, RecentMusicMode, RecentShowsMode, RecentlyPlayedPreferences,
+};
 use sqlx::{QueryBuilder, Sqlite};
 
 use super::{Store, StoreError, push_in_list};
@@ -58,6 +61,11 @@ pub struct PlayRow {
     pub device_name: Option<String>,
     pub path: String,
     pub playback_id: Option<String>,
+    /// Where it was started: `album`, `playlist` or `queued`.
+    pub source_kind: Option<String>,
+    pub source_id: Option<String>,
+    /// An episode's season.
+    pub season_id: Option<String>,
 }
 
 /// A play to open.
@@ -73,6 +81,105 @@ pub struct NewPlay<'a> {
     pub endpoint_id: Option<&'a str>,
     pub device_name: Option<&'a str>,
     pub playback_id: Option<&'a str>,
+    /// Where a track's play was started.
+    pub source: Option<&'a PlaySource>,
+    /// An episode's season.
+    pub season_id: Option<&'a str>,
+}
+
+/// `source` as the `source_kind` and `source_id` columns keep it: an
+/// unknown source is none.
+fn source_columns(source: Option<&PlaySource>) -> (Option<&'static str>, Option<String>) {
+    match source {
+        Some(PlaySource::Album { id }) => (Some("album"), Some(id.to_string())),
+        Some(PlaySource::Playlist { id }) => (Some("playlist"), Some(id.clone())),
+        Some(PlaySource::Queued) => (Some("queued"), None),
+        Some(PlaySource::Unknown) | None => (None, None),
+    }
+}
+
+/// What a "Recently played" row card is of, by its id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RowCard {
+    /// A film's MediaId.
+    Movie(String),
+    /// A show's MediaId.
+    Show(String),
+    /// A season's MediaId.
+    Season(String),
+    /// The season of the episode with this MediaId, to look up: its play
+    /// is from before plays kept the season.
+    SeasonOf(String),
+    /// An episode's MediaId.
+    Episode(String),
+    /// An album's MediaId.
+    Album(String),
+    /// A playlist's id.
+    Playlist(String),
+    /// A track's MediaId.
+    Track(String),
+}
+
+/// How [`Store::recently_played_row`] makes each play a card: by the
+/// user's preferences, with `playlists` the playlists they see now. A
+/// play from another playlist shows its album.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowBy<'a> {
+    pub preferences: RecentlyPlayedPreferences,
+    pub playlists: &'a [String],
+}
+
+/// The card of each play of a track, its kind or (with `id`) its id, as
+/// SQL: by where it was started (a playlist of `playlists`, the track
+/// itself when queued by hand, else its album), each track its own, or
+/// each its album.
+fn push_track_card(
+    query: &mut QueryBuilder<Sqlite>,
+    music: RecentMusicMode,
+    playlists: &[String],
+    id: bool,
+) {
+    match music {
+        RecentMusicMode::Tracks => {
+            query.push(if id { "media_id" } else { "'track'" });
+        }
+        RecentMusicMode::Albums => {
+            query.push(if id { "album_id" } else { "'album'" });
+        }
+        RecentMusicMode::Sources | RecentMusicMode::Unknown | RecentMusicMode::Hidden => {
+            query.push("CASE WHEN source_kind = 'queued' THEN ");
+            query.push(if id { "media_id " } else { "'track' " });
+            if !playlists.is_empty() {
+                query.push("WHEN source_kind = 'playlist' AND source_id IN ");
+                push_in_list(query, playlists);
+                query.push(if id {
+                    " THEN source_id "
+                } else {
+                    " THEN 'playlist' "
+                });
+            }
+            query.push(if id {
+                "ELSE album_id END"
+            } else {
+                "ELSE 'album' END"
+            });
+        }
+    }
+}
+
+/// The card of each play of an episode, as [`push_track_card`]'s: its
+/// show, its season (looked up when the play did not keep it), or itself.
+fn push_episode_card(query: &mut QueryBuilder<Sqlite>, shows: RecentShowsMode, id: bool) {
+    query.push(match (shows, id) {
+        (RecentShowsMode::Show, false) => "'show'",
+        (RecentShowsMode::Show, true) => "show_id",
+        (RecentShowsMode::Season, false) => {
+            "CASE WHEN season_id IS NULL THEN 'season_of' ELSE 'season' END"
+        }
+        (RecentShowsMode::Season, true) => "coalesce(season_id, media_id)",
+        (_, false) => "'episode'",
+        (_, true) => "media_id",
+    });
 }
 
 /// An open play as far as it has got.
@@ -127,12 +234,14 @@ impl Store {
     ) -> Result<i64, StoreError> {
         let principal = principal.to_string();
         let now = self.now();
+        let (source_kind, source_id) = source_columns(play.source);
         let mut tx = self.begin_write().await?;
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO plays \
                (principal, media_id, kind, show_id, album_id, artist_id, started_at, ended_at, \
-                duration_ms, endpoint_id, device_name, playback_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11) RETURNING id",
+                duration_ms, endpoint_id, device_name, playback_id, source_kind, source_id, \
+                season_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) RETURNING id",
         )
         .bind(&principal)
         .bind(play.media_id)
@@ -145,6 +254,9 @@ impl Store {
         .bind(play.endpoint_id)
         .bind(play.device_name)
         .bind(play.playback_id)
+        .bind(source_kind)
+        .bind(source_id)
+        .bind(play.season_id)
         .fetch_one(&mut *tx)
         .await?;
         note_play_ids(&mut tx, &principal, &play).await?;
@@ -200,12 +312,14 @@ impl Store {
         if there.is_some() {
             return Ok(false);
         }
+        let (source_kind, source_id) = source_columns(play.source);
         sqlx::query(
             "INSERT INTO plays \
                (principal, media_id, kind, show_id, album_id, artist_id, started_at, ended_at, \
                 played_ms, duration_ms, counted, closed, endpoint_id, device_name, path, \
-                playback_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, 'offline', ?14)",
+                playback_id, source_kind, source_id, season_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, 'offline', ?14, \
+               ?15, ?16, ?17)",
         )
         .bind(&principal)
         .bind(play.media_id)
@@ -221,6 +335,9 @@ impl Store {
         .bind(play.endpoint_id)
         .bind(play.device_name)
         .bind(play.playback_id)
+        .bind(source_kind)
+        .bind(source_id)
+        .bind(play.season_id)
         .execute(&mut *tx)
         .await?;
         note_play_ids(&mut tx, &principal, &play).await?;
@@ -242,7 +359,7 @@ impl Store {
         Ok(sqlx::query_as(
             "SELECT id, media_id, kind, show_id, album_id, artist_id, started_at, ended_at, \
                played_ms, duration_ms, counted, closed, endpoint_id, device_name, path, \
-               playback_id \
+               playback_id, source_kind, source_id, season_id \
              FROM plays WHERE principal = ?1 ORDER BY id",
         )
         .bind(principal.to_string())
@@ -319,6 +436,116 @@ impl Store {
             count.build_query_scalar().fetch_one(&self.pool),
         )?;
         Ok((ids, u32::try_from(total).unwrap_or(u32::MAX)))
+    }
+
+    /// `principal`'s "Recently played" row: the cards their counted plays
+    /// make, as `by` says, each once by its latest play, newest first; at
+    /// most `limit`. A kind hidden makes none, and with every kind hidden
+    /// there are none. A play whose album, show or season is not known
+    /// makes no such card.
+    pub async fn recently_played_row(
+        &self,
+        principal: Principal,
+        by: RowBy<'_>,
+        limit: u32,
+        federated: bool,
+    ) -> Result<Vec<RowCard>, StoreError> {
+        let RowBy {
+            preferences,
+            playlists,
+        } = by;
+        let kinds: Vec<&str> = [
+            (preferences.movies != RecentMoviesMode::Hidden, "movie"),
+            (preferences.shows != RecentShowsMode::Hidden, "episode"),
+            (preferences.music != RecentMusicMode::Hidden, "track"),
+        ]
+        .into_iter()
+        .filter_map(|(shown, kind)| shown.then_some(kind))
+        .collect();
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT ");
+        for id in [false, true] {
+            query.push(if id { ", " } else { "" });
+            query.push(if id {
+                "CASE kind WHEN 'movie' THEN media_id WHEN 'episode' THEN "
+            } else {
+                "CASE kind WHEN 'movie' THEN 'movie' WHEN 'episode' THEN "
+            });
+            push_episode_card(&mut query, preferences.shows, id);
+            query.push(" ELSE ");
+            push_track_card(&mut query, preferences.music, playlists, id);
+            query.push(" END");
+        }
+        query
+            .push(" AS card_id FROM plays WHERE counted = 1 AND principal = ")
+            .push_bind(principal.to_string())
+            .push(" AND kind IN ");
+        push_in_list(&mut query, kinds);
+        if !federated {
+            query.push(concat!(" AND ", own_item!("media_id")));
+        }
+        query
+            .push(
+                " GROUP BY 1, 2 HAVING card_id IS NOT NULL \
+                 ORDER BY max(ended_at) DESC, max(id) DESC LIMIT ",
+            )
+            .push_bind(limit);
+        let rows: Vec<(String, String)> = query.build_query_as().fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(card, id)| {
+                Some(match card.as_str() {
+                    "movie" => RowCard::Movie(id),
+                    "show" => RowCard::Show(id),
+                    "season" => RowCard::Season(id),
+                    "season_of" => RowCard::SeasonOf(id),
+                    "episode" => RowCard::Episode(id),
+                    "album" => RowCard::Album(id),
+                    "playlist" => RowCard::Playlist(id),
+                    "track" => RowCard::Track(id),
+                    _ => return None,
+                })
+            })
+            .collect())
+    }
+
+    /// How each kind shows in `principal`'s row; the defaults if they set
+    /// none.
+    pub async fn recently_played_preferences(
+        &self,
+        principal: Principal,
+    ) -> Result<RecentlyPlayedPreferences, StoreError> {
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT preferences FROM recently_played_preferences WHERE principal = ?1",
+        )
+        .bind(principal.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(json
+            .and_then(|j| super::tracks::parse_over_defaults("recently played preferences", &j))
+            .unwrap_or_default())
+    }
+
+    pub async fn set_recently_played_preferences(
+        &self,
+        principal: Principal,
+        preferences: &RecentlyPlayedPreferences,
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(preferences).expect("preferences always serialize");
+        sqlx::query(
+            "INSERT INTO recently_played_preferences (principal, preferences, updated_at) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT (principal) DO UPDATE SET \
+               preferences = excluded.preferences, updated_at = excluded.updated_at",
+        )
+        .bind(principal.to_string())
+        .bind(json)
+        .bind(self.now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// The key that an item with one of `external_ids` has plays under,
@@ -403,7 +630,294 @@ mod tests {
             endpoint_id: Some("e"),
             device_name: None,
             playback_id: Some("p"),
+            source: None,
+            season_id: None,
         }
+    }
+
+    /// Alice's counted play of `track`, on `album`, from `source`.
+    async fn played(store: &Store, track: &str, album: &str, source: Option<PlaySource>) {
+        let mut new = play(track, PlayedKind::Track, &[]);
+        new.album_id = Some(album);
+        new.source = source.as_ref();
+        let id = store.open_play(ALICE, new).await.unwrap();
+        store.update_play(id, COUNTED).await.unwrap();
+    }
+
+    /// Alice's counted play of episode `episode` of show 10, in `season`
+    /// (`None`: a play from before plays kept it).
+    async fn watched(store: &Store, episode: &str, season: Option<&str>) {
+        let mut new = play(episode, PlayedKind::Episode, &[]);
+        new.show_id = Some("plex:show:10");
+        new.season_id = season;
+        let id = store.open_play(ALICE, new).await.unwrap();
+        store.update_play(id, COUNTED).await.unwrap();
+    }
+
+    /// Alice's counted play of film `movie`.
+    async fn seen_film(store: &Store, movie: &str) {
+        let id = store
+            .open_play(ALICE, play(movie, PlayedKind::Movie, &[]))
+            .await
+            .unwrap();
+        store.update_play(id, COUNTED).await.unwrap();
+    }
+
+    fn album_source(key: &str) -> PlaySource {
+        PlaySource::Album {
+            id: format!("plex:album:{key}").parse().unwrap(),
+        }
+    }
+
+    fn playlist(id: &str) -> PlaySource {
+        PlaySource::Playlist { id: id.into() }
+    }
+
+    /// Plays from an album, a playlist (p1), and the queue, oldest first.
+    async fn three_sources(store: &Store) {
+        played(
+            store,
+            "plex:track:1",
+            "plex:album:1",
+            Some(album_source("1")),
+        )
+        .await;
+        played(store, "plex:track:2", "plex:album:2", Some(playlist("p1"))).await;
+        played(
+            store,
+            "plex:track:3",
+            "plex:album:3",
+            Some(PlaySource::Queued),
+        )
+        .await;
+    }
+
+    /// Every kind: a film, two episodes of season 11 and one of season 14
+    /// (from before seasons were kept), and two tracks of album 1, one
+    /// from p1. Oldest first.
+    async fn every_kind(store: &Store) {
+        seen_film(store, "plex:movie:1").await;
+        watched(store, "plex:episode:12", Some("plex:season:11")).await;
+        played(store, "plex:track:1", "plex:album:1", Some(playlist("p1"))).await;
+        watched(store, "plex:episode:13", Some("plex:season:11")).await;
+        watched(store, "plex:episode:15", None).await;
+        played(store, "plex:track:2", "plex:album:1", None).await;
+    }
+
+    async fn row(store: &Store, preferences: RecentlyPlayedPreferences) -> Vec<RowCard> {
+        let playlists = ["p1".to_owned()];
+        let by = RowBy {
+            preferences,
+            playlists: &playlists,
+        };
+        store
+            .recently_played_row(ALICE, by, 10, false)
+            .await
+            .unwrap()
+    }
+
+    fn with_music(music: RecentMusicMode) -> RecentlyPlayedPreferences {
+        RecentlyPlayedPreferences {
+            music,
+            ..RecentlyPlayedPreferences::default()
+        }
+    }
+
+    fn with_shows(shows: RecentShowsMode) -> RecentlyPlayedPreferences {
+        RecentlyPlayedPreferences {
+            shows,
+            ..RecentlyPlayedPreferences::default()
+        }
+    }
+
+    fn card(kind: fn(String) -> RowCard, id: &str) -> RowCard {
+        kind(id.to_owned())
+    }
+
+    #[tokio::test]
+    async fn by_source_each_play_shows_where_it_was_started_newest_first() {
+        let store = test_store("plays-row-sources").await;
+        three_sources(&store).await;
+        assert_eq!(
+            row(&store, with_music(RecentMusicMode::Sources)).await,
+            [
+                card(RowCard::Track, "plex:track:3"),
+                card(RowCard::Playlist, "p1"),
+                card(RowCard::Album, "plex:album:1"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn by_track_each_track_is_its_own_card() {
+        let store = test_store("plays-row-tracks").await;
+        three_sources(&store).await;
+        assert_eq!(
+            row(&store, with_music(RecentMusicMode::Tracks)).await,
+            [
+                card(RowCard::Track, "plex:track:3"),
+                card(RowCard::Track, "plex:track:2"),
+                card(RowCard::Track, "plex:track:1"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn by_album_every_track_folds_into_its_album_whatever_its_source() {
+        let store = test_store("plays-row-albums").await;
+        three_sources(&store).await;
+        played(
+            &store,
+            "plex:track:4",
+            "plex:album:1",
+            Some(PlaySource::Queued),
+        )
+        .await;
+        assert_eq!(
+            row(&store, with_music(RecentMusicMode::Albums)).await,
+            [
+                card(RowCard::Album, "plex:album:1"),
+                card(RowCard::Album, "plex:album:3"),
+                card(RowCard::Album, "plex:album:2"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_playlist_not_seen_shows_the_play_s_album() {
+        let store = test_store("plays-row-unseen").await;
+        played(&store, "plex:track:2", "plex:album:2", Some(playlist("p2"))).await;
+        assert_eq!(
+            row(&store, RecentlyPlayedPreferences::default()).await,
+            [card(RowCard::Album, "plex:album:2")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_play_with_no_source_shows_its_album() {
+        let store = test_store("plays-row-old").await;
+        played(&store, "plex:track:1", "plex:album:1", None).await;
+        assert_eq!(
+            row(&store, RecentlyPlayedPreferences::default()).await,
+            [card(RowCard::Album, "plex:album:1")]
+        );
+    }
+
+    /// The defaults on every kind: by source, each episode, each film,
+    /// mixed newest first.
+    #[tokio::test]
+    async fn the_row_mixes_every_kind_newest_first() {
+        let store = test_store("plays-row-mixed").await;
+        every_kind(&store).await;
+        assert_eq!(
+            row(&store, RecentlyPlayedPreferences::default()).await,
+            [
+                card(RowCard::Album, "plex:album:1"),
+                card(RowCard::Episode, "plex:episode:15"),
+                card(RowCard::Episode, "plex:episode:13"),
+                card(RowCard::Playlist, "p1"),
+                card(RowCard::Episode, "plex:episode:12"),
+                card(RowCard::Movie, "plex:movie:1"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn by_show_a_show_is_one_card_at_its_latest_episode() {
+        let store = test_store("plays-row-show").await;
+        every_kind(&store).await;
+        let cards = row(&store, with_shows(RecentShowsMode::Show)).await;
+        assert_eq!(
+            cards[..2],
+            [
+                card(RowCard::Album, "plex:album:1"),
+                card(RowCard::Show, "plex:show:10"),
+            ]
+        );
+    }
+
+    /// Season 14's play kept no season: it is looked up.
+    #[tokio::test]
+    async fn by_season_each_season_is_one_card() {
+        let store = test_store("plays-row-season").await;
+        every_kind(&store).await;
+        let cards = row(&store, with_shows(RecentShowsMode::Season)).await;
+        assert_eq!(
+            cards[1..3],
+            [
+                card(RowCard::SeasonOf, "plex:episode:15"),
+                card(RowCard::Season, "plex:season:11"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kind_hidden_leaves_the_others_in_the_row() {
+        let store = test_store("plays-row-hidden-one").await;
+        every_kind(&store).await;
+        let preferences = RecentlyPlayedPreferences {
+            shows: RecentShowsMode::Hidden,
+            movies: RecentMoviesMode::Hidden,
+            ..RecentlyPlayedPreferences::default()
+        };
+        assert_eq!(
+            row(&store, preferences).await,
+            [
+                card(RowCard::Album, "plex:album:1"),
+                card(RowCard::Playlist, "p1"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_kind_hidden_is_an_empty_row() {
+        let store = test_store("plays-row-hidden-all").await;
+        every_kind(&store).await;
+        let hidden = RecentlyPlayedPreferences {
+            music: RecentMusicMode::Hidden,
+            shows: RecentShowsMode::Hidden,
+            movies: RecentMoviesMode::Hidden,
+        };
+        assert!(row(&store, hidden).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_play_keeps_its_source_and_season() {
+        let store = test_store("plays-row-kept").await;
+        played(&store, "plex:track:2", "plex:album:2", Some(playlist("p1"))).await;
+        watched(&store, "plex:episode:12", Some("plex:season:11")).await;
+        let rows = store.all_plays(ALICE).await.unwrap();
+        assert_eq!(
+            (
+                rows[0].source_kind.as_deref(),
+                rows[0].source_id.as_deref(),
+                rows[1].season_id.as_deref()
+            ),
+            (Some("playlist"), Some("p1"), Some("plex:season:11"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recently_played_preferences_are_the_defaults_until_set() {
+        let store = test_store("plays-row-preferences").await;
+        assert_eq!(
+            store.recently_played_preferences(ALICE).await.unwrap(),
+            RecentlyPlayedPreferences::default()
+        );
+        let set = RecentlyPlayedPreferences {
+            music: RecentMusicMode::Albums,
+            shows: RecentShowsMode::Season,
+            movies: RecentMoviesMode::Hidden,
+        };
+        store
+            .set_recently_played_preferences(ALICE, &set)
+            .await
+            .unwrap();
+        assert_eq!(store.recently_played_preferences(ALICE).await.unwrap(), set);
+        assert_eq!(
+            store.recently_played_preferences(BOB).await.unwrap(),
+            RecentlyPlayedPreferences::default()
+        );
     }
 
     const COUNTED: PlayUpdate = PlayUpdate {

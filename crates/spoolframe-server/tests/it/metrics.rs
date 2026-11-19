@@ -168,6 +168,7 @@ async fn start(client: &TestClient, session: &SessionId) -> PlaybackHandle {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;

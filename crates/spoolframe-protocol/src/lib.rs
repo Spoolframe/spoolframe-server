@@ -33,6 +33,7 @@ pub mod plex;
 pub mod policy;
 pub mod portable;
 pub mod previews;
+pub mod recently_played;
 pub mod relay_access;
 pub mod resource;
 pub mod rpc;

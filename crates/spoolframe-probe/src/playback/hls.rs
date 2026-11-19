@@ -137,6 +137,7 @@ pub(super) async fn converted(
         display: None,
         capabilities: None,
         onward_share: None,
+        source: None,
     };
     let handle = match probe.request(&conn, Some(&a.session), start).await? {
         Response::Ok(Reply::PlaybackStarted { handle, plan, .. }) => {

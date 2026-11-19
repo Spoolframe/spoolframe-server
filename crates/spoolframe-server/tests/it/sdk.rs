@@ -138,6 +138,7 @@ async fn a_share_watch_ends_once_the_playback_and_client_are_dropped() {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1291,6 +1292,7 @@ async fn the_ffi_s_delivery_reaches_the_plan() {
             None,
             Some(ConversionDelivery::Progressive),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1336,6 +1338,7 @@ async fn the_ffi_s_audio_reaches_the_plan() {
             None,
             Some(ConversionDelivery::Progressive),
             Some(audio()),
+            None,
         )
         .await
         .unwrap();
@@ -1358,6 +1361,7 @@ async fn the_ffi_s_audio_reaches_the_plan() {
             None,
             None,
             Some(audio()),
+            None,
         )
         .await
         .unwrap();

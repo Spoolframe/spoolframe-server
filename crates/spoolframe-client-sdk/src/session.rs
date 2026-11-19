@@ -298,6 +298,14 @@ pub struct PlaybackOptions {
     /// device's. [`Session::playback_plan_on`] has no such word on the wire:
     /// its plan is for the device's own list.
     pub audio: Option<PlaybackAudio>,
+    /// Where a track's play was started: the playlist, the album, or the
+    /// queue by hand ([`crate::queue::PlayQueue::current_source`],
+    /// [`crate::PlaylistCursor::source`]). The server keeps it with the
+    /// play for Home's "Recently played" row
+    /// ([`crate::On::recently_played_row`]); one that does not know it
+    /// ignores it. `None`: no source, and the
+    /// play shows its album.
+    pub source: Option<crate::PlaySource>,
 }
 
 /// The sound one playback may carry. A file whose picked audio track is
@@ -1384,6 +1392,7 @@ impl Session {
                 options.audio,
             ),
             onward_share: None,
+            source: options.source,
         };
         match self.call(request).await? {
             Reply::PlaybackStarted {

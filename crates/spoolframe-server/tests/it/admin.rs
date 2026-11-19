@@ -290,7 +290,8 @@ async fn an_admin_sees_the_server_s_status_and_a_user_does_not() {
             "spoolframe:october-2026",
             "spoolframe:download-addons",
             "spoolframe:diagnostics",
-            "spoolframe:phone-sign-in"
+            "spoolframe:phone-sign-in",
+            "spoolframe:recently-played-row"
         ]
     );
     assert_eq!(status.experimental_features, ["http-playback"]);

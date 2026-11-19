@@ -83,6 +83,7 @@ async fn start(
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -543,6 +544,7 @@ async fn text_without_tesseract_cannot_play_and_says_why() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -650,6 +652,7 @@ async fn a_subtitle_change_in_direct_play_changes_only_the_text() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;

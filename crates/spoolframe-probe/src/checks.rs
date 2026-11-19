@@ -342,6 +342,7 @@ async fn unauthenticated(probe: &Probe) -> Result<Outcome, Problem> {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         ),
     ];

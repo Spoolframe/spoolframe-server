@@ -848,7 +848,20 @@ impl Downloads {
     /// The user played track `key` here, from its file, for `played`: the
     /// play is sent the next time the server is reached (play counts,
     /// last played), and the track counts as just played for the cache.
+    /// With no source: [`Self::record_play_from`] says where it was
+    /// started.
     pub async fn record_play(&self, key: &str, played: Duration) -> Result<(), SdkError> {
+        self.record_play_from(key, played, None).await
+    }
+
+    /// [`Self::record_play`], started from `source` (the playlist, the
+    /// album, or the queue by hand), for Home's "Recently played" row.
+    pub async fn record_play_from(
+        &self,
+        key: &str,
+        played: Duration,
+        source: Option<crate::PlaySource>,
+    ) -> Result<(), SdkError> {
         let shared = self.shared();
         let store = shared.store()?;
         let m = store
@@ -869,6 +882,7 @@ impl Downloads {
             track: m.item.id().clone(),
             at: now(),
             played_ms: played.as_millis() as u64,
+            source,
         };
         shared
             .pending(store, &m.server, &user_id, |p| p.plays.push(play))

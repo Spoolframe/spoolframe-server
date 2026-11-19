@@ -47,6 +47,7 @@ async fn read_a_large_file() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await

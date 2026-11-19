@@ -683,6 +683,36 @@ async fn sync(
     }
 }
 
+/// A play made offline keeps where it was started, as one made online.
+#[tokio::test]
+async fn a_play_made_offline_keeps_its_source() {
+    let server = TestServer::start("music-offline-source").await;
+    server.add_user("alice", PASSWORD, None).await;
+    let (laptop, session) = device(&server, Platform::Linux, "alice").await;
+    let device_now = server.clock.unix_secs();
+    let play = OfflinePlay {
+        track: track_id("32"),
+        at: device_now - 60,
+        played_ms: 240_000,
+        source: Some(spoolframe_protocol::recently_played::PlaySource::Playlist {
+            id: "p1".into(),
+        }),
+    };
+    sync(&laptop, &session, device_now, vec![play], vec![]).await;
+    let plays = server
+        .store
+        .all_plays(alice(&server).await.principal)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            plays[0].source_kind.as_deref(),
+            plays[0].source_id.as_deref()
+        ),
+        (Some("playlist"), Some("p1"))
+    );
+}
+
 #[tokio::test]
 async fn a_play_made_offline_reaches_the_server_once_at_its_time() {
     let server = TestServer::start("music-offline-plays").await;
@@ -695,6 +725,7 @@ async fn a_play_made_offline_reaches_the_server_once_at_its_time() {
         track: track_id("32"),
         at: device_now - 3600,
         played_ms: 240_000,
+        source: None,
     };
     let first = sync(&laptop, &session, device_now, vec![play.clone()], vec![]).await;
     // The server read its clock in between: a second may have ticked

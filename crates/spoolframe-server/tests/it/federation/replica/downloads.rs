@@ -326,6 +326,7 @@ async fn a_download_token_reads_its_download_alone_and_plays_nothing() {
             display: None,
             capabilities: None,
             onward_share: None,
+            source: None,
         },
         Request::PrepareDownload {
             id: movie().id().clone(),
@@ -824,6 +825,7 @@ async fn reading_sa_s_file_off_its_lan_takes_no_play_s_wan_stream() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;

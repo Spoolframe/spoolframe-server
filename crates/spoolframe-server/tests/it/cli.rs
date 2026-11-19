@@ -44,7 +44,7 @@ async fn version_names_the_binary_and_its_version() {
         rest,
         [
             format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
-            "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics, spoolframe:phone-sign-in",
+            "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics, spoolframe:phone-sign-in, spoolframe:recently-played-row",
             "experimental features (each on by its setting): http-playback, federation, smart-crop",
         ]
     );

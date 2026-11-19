@@ -116,6 +116,11 @@ pub fn retry_safe(request: &Request) -> bool {
         | Request::ListShareCandidates { .. }
         // A read.
         | Request::RecentlyPlayed { .. }
+        // Reads.
+        | Request::RecentlyPlayedRow { .. }
+        | Request::RecentlyPlayedPreferences
+        // Keeping the same preferences twice is keeping them once.
+        | Request::SetRecentlyPlayedPreferences { .. }
         // Where a paired server is, read.
         | Request::RemoteHints { .. }
         // A read; settings saved twice are saved once, and shuffle turned

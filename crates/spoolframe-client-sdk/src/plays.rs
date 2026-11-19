@@ -7,9 +7,11 @@
 //! user's items by their latest play.
 
 use spoolframe_protocol::playlists::Kinds;
+use spoolframe_protocol::recently_played::{RecentCard, RecentlyPlayedPreferences};
 use spoolframe_protocol::{Reply, Request};
 use spoolframe_types::{Album, Item};
 
+use crate::gate::{On, RecentlyPlayedRow};
 use crate::{ItemsPage, SdkError, Session};
 
 impl Session {
@@ -55,6 +57,60 @@ impl Session {
         };
         let played = self.recently_played(Some(tracks), 0, RECENT_TRACKS).await?;
         Ok(recent_albums(&played.items, limit))
+    }
+}
+
+impl On<RecentlyPlayedRow> {
+    /// Home's one "Recently played" row: at most `limit` cards
+    /// ([`spoolframe_protocol::recently_played::MAX_ROW`]), newest first,
+    /// each once at its latest play, every kind as the user's
+    /// [`RecentlyPlayedPreferences`] say. Music by where each play was
+    /// started ([`crate::PlaybackOptions::source`]), each track, or each
+    /// album; shows by show, season or episode; films each their own. A
+    /// kind hidden is left out; with every kind hidden the row is empty,
+    /// and the app shows none. A card this build does not know is left
+    /// out.
+    pub async fn recently_played_row(&self, limit: u32) -> Result<Vec<RecentCard>, SdkError> {
+        match self
+            .session
+            .call(Request::RecentlyPlayedRow { limit })
+            .await?
+        {
+            Reply::RecentlyPlayedRow { mut cards } => {
+                cards.retain(|card| !matches!(card, RecentCard::Unknown));
+                Ok(cards)
+            }
+            other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),
+        }
+    }
+
+    /// How each kind shows in the user's row, kept on the server; the
+    /// defaults if they set none.
+    pub async fn recently_played_preferences(&self) -> Result<RecentlyPlayedPreferences, SdkError> {
+        match self
+            .session
+            .call(Request::RecentlyPlayedPreferences)
+            .await?
+        {
+            Reply::RecentlyPlayedPreferences { preferences } => Ok(preferences),
+            other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),
+        }
+    }
+
+    /// Keep `preferences` as the user's, on every device of theirs. They
+    /// change only what the row shows: every play is recorded and counted.
+    pub async fn set_recently_played_preferences(
+        &self,
+        preferences: RecentlyPlayedPreferences,
+    ) -> Result<(), SdkError> {
+        match self
+            .session
+            .call(Request::SetRecentlyPlayedPreferences { preferences })
+            .await?
+        {
+            Reply::Done => Ok(()),
+            other => Err(SdkError::Protocol(format!("unexpected reply {other:?}"))),
+        }
     }
 }
 

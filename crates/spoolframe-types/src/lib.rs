@@ -58,8 +58,9 @@ pub use model::{
 };
 pub use platform::Platform;
 pub use preferences::{
-    AudioPreferences, BitmapPreference, ForcedPreference, SdhPreference, SubtitleMode,
-    SubtitlePreferences, TrackPreferences,
+    AudioPreferences, BitmapPreference, ForcedPreference, RecentMoviesMode, RecentMusicMode,
+    RecentShowsMode, RecentlyPlayedPreferences, SdhPreference, SubtitleMode, SubtitlePreferences,
+    TrackPreferences,
 };
 pub use role::Role;
 pub use search::{Person, PersonRole, SearchKind, SearchScope};

@@ -2043,12 +2043,14 @@ it is off, with nothing sent. A request of a feature that went off since
 | `spoolframe:download-addons` | `download_addon_options`, `read_track_subtitle` and `prepare_audio_addon` ([download add-ons](#download-add-ons)) |
 | `spoolframe:diagnostics` | `send_diagnostics` ([sending diagnostics](#sending-diagnostics)) |
 | `spoolframe:phone-sign-in` | `offer_device_sign_in` ([signing in with a phone](#signing-in-with-a-phone)) |
+| `spoolframe:recently-played-row` | `recently_played_row`, `recently_played_preferences` and `set_recently_played_preferences` ([the recently played row](#the-recently-played-row)) |
 
 The names are dated: a feature is what was added by its date. Later
-additions get a new dated name, and a name stays once added. Three are
-not: `spoolframe:download-addons`, `spoolframe:diagnostics` and
-`spoolframe:phone-sign-in` are named for what they bring, by the
-user's choice, so an app can name each on its own.
+additions get a new dated name, and a name stays once added. Four are
+not: `spoolframe:download-addons`, `spoolframe:diagnostics`,
+`spoolframe:phone-sign-in` and `spoolframe:recently-played-row` are
+named for what they bring, by the user's choice, so an app can name
+each on its own.
 
 A new reply field needs neither. It is `serde(default)`, so a reply from
 an older server decodes. Where its absence means something other than
@@ -2426,6 +2428,110 @@ the rest of their data.
 
 SDK: `Session::recently_played(kinds, offset, limit)` returns an
 `ItemsPage`; the fields arrive on `ItemDetail.item` and `children`.
+
+### The recently played row
+
+Home's "Recently played" is one row that mixes every kind: films,
+shows and music. Each user chooses how each kind shows in it.
+
+**The setting changes only what the row shows.** Every play is recorded
+and counted whatever it says: `play_count`, `last_played_at`,
+`RecentlyPlayed` and the admin's history are the same with every kind
+hidden.
+
+#### Where a track was started
+
+The client says where it started a track with `source` on
+`StartPlayback`, and on each `OfflinePlay` of `SyncOfflinePlays`. Left
+out, the play has no source. The field needs no feature: a server that
+does not know it ignores it. A `PlaySource` is tagged by `kind`:
+
+| `kind` | Fields | When |
+|---|---|---|
+| `album` | `id`, the album's MediaId | Playing an album, in order or shuffled |
+| `playlist` | `id`, the playlist's | Playing a playlist, Liked and All included |
+| `queued` | none | "Play next" or "Add to queue" |
+
+A kind the server does not know is kept as no source.
+
+#### The row
+
+With feature `spoolframe:recently-played-row`, `RecentlyPlayedRow {
+limit }` answers `RecentlyPlayedRow { cards }`: at most `limit` (50)
+cards, newest first. Each card is listed once, at its latest counted
+play. A card is tagged by `type`:
+
+| `type` | Carries |
+|---|---|
+| `movie` | `movie` |
+| `show` | `show` |
+| `season` | `season` |
+| `episode` | `episode` |
+| `album` | `album` |
+| `playlist` | `playlist`, a `PlaylistSummary` |
+| `track` | `track` |
+
+A film, an episode or a track has its watch state, `play_count` and
+`last_played_at` filled. A client leaves out a `type` it does not know.
+An item the catalog does not serve the user now is left out, so a row
+may have fewer cards than `limit`.
+
+#### The setting
+
+`RecentlyPlayedPreferences` answers `RecentlyPlayedPreferences {
+preferences }`, the defaults when the user set none.
+`SetRecentlyPlayedPreferences { preferences }` answers `Done`. The
+setting is kept on the server for every device of the user's. It has
+three fields:
+
+`music`:
+
+- `sources`, the default: by where each play was started. A play from a
+  playlist shows the playlist. A play from an album, or with no source
+  (every play from before 0.17.5), shows the album. A track queued by
+  hand shows the track. A play from a playlist the user no longer sees
+  shows its album.
+- `tracks`: each track played is its own card.
+- `albums`: each track played folds into its album card, whatever its
+  source.
+- `hidden`: no music in the row.
+
+`shows`:
+
+- `show`: one card for the show, at its latest episode played.
+- `season`: one card for each season played.
+- `episode`, the default: each episode played is its own card.
+- `hidden`: no shows in the row.
+
+`movies`:
+
+- `movie`, the default: each film played is its own card.
+- `hidden`: no films in the row.
+
+`hidden` hides only that kind; the other kinds stay in the row. **When
+all three are hidden, the answer is empty, and the app shows no row.**
+A value the client does not know reads as that field's default.
+
+#### SDK
+
+- `PlaybackOptions::source` says where a playback was started. Use
+  `PlaylistCursor::source()` for a playlist the server plays, and
+  `PlayQueue::current_source()` for the app's own queue: `queued` for an
+  item added by hand, else the context's playlist
+  (`set_context_playlist`), else its album.
+- `Downloads::record_play_from(key, played, source)` does the same for
+  a play made offline.
+- On `On<RecentlyPlayedRow>`: `recently_played_row(limit)`,
+  `recently_played_preferences()` and
+  `set_recently_played_preferences(preferences)`. Setting them clears
+  Home from the catalog cache.
+- `recently_played` and `recently_played_albums` are unchanged. Without
+  the feature, an app builds its row from them as before.
+
+FFI: an optional `source` on `play`, `open_playback` and
+`record_offline_play`, and `SpoolSession.recently_played_row()` for the
+calls. The web profile page's Playback card sets the same three
+fields, as Music, Shows and Movies under "Recently played".
 
 ## Sorting and filtering a library
 

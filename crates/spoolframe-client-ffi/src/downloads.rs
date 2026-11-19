@@ -252,15 +252,18 @@ impl SpoolClient {
         Ok(run(async move { downloads.set_watched(&key, watched).await }).await?)
     }
 
-    /// Track `key` played here from its file for `played`: sent the next
-    /// time its server is reached.
+    /// Track `key` played here from its file for `played`, started from
+    /// `source` (its album, its playlist, or the queue by hand): sent the
+    /// next time its server is reached.
+    #[uniffi::method(default(source = None))]
     pub async fn record_offline_play(
         &self,
         key: String,
         played: Duration,
+        source: Option<sdk::PlaySource>,
     ) -> Result<(), SpoolError> {
         let downloads = self.client.downloads();
-        Ok(run(async move { downloads.record_play(&key, played).await }).await?)
+        Ok(run(async move { downloads.record_play_from(&key, played, source).await }).await?)
     }
 
     pub async fn record_offline_like(&self, key: String, liked: bool) -> Result<(), SpoolError> {

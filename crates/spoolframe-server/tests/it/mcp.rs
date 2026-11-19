@@ -314,7 +314,7 @@ async fn a_client_initializes_and_lists_the_tools_of_its_scopes_only() {
         lines,
         [
             format!("client protocol: {}", spoolframe_protocol::PROTOCOL_VERSION).as_str(),
-            "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics, spoolframe:phone-sign-in",
+            "features: spoolframe:october-2026, spoolframe:download-addons, spoolframe:diagnostics, spoolframe:phone-sign-in, spoolframe:recently-played-row",
             "experimental features on: http-playback",
         ]
     );

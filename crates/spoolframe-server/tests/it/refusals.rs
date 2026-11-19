@@ -532,6 +532,7 @@ async fn another_session_s_playback_is_logged() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await

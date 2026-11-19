@@ -35,7 +35,7 @@ pub(crate) static LISTENER: tokio::sync::Mutex<Option<(u16, tokio::task::AbortHa
 impl SpoolSession {
     /// Start playing `id` for a URL player: `open_playback`, served on
     /// the loopback bridge, at `info().url`.
-    #[uniffi::method(default(delivery = None, audio = None))]
+    #[uniffi::method(default(delivery = None, audio = None, source = None))]
     #[allow(clippy::too_many_arguments)]
     pub async fn play(
         &self,
@@ -46,9 +46,10 @@ impl SpoolSession {
         display: Option<ScreenCapabilities>,
         delivery: Option<ConversionDelivery>,
         audio: Option<AudioOutput>,
+        source: Option<spoolframe_client_sdk::PlaySource>,
     ) -> Result<Arc<SpoolPlayback>, SpoolError> {
         let session = self.session.clone();
-        let options = play_options(start, quality, display, delivery, audio);
+        let options = play_options(start, quality, display, delivery, audio, source);
         let opened = run(async move {
             let opened = open(session, id, tracks, options).await?;
             serve_opened(opened).await

@@ -178,6 +178,7 @@ async fn an_invite_makes_an_account_that_signs_in_and_plays() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;

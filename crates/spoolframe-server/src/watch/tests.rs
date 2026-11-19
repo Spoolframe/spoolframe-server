@@ -969,6 +969,8 @@ async fn played_under(h: &Harness, who: Principal, media_id: &str) {
                 endpoint_id: None,
                 device_name: None,
                 playback_id: None,
+                source: None,
+                season_id: None,
             },
         )
         .await

@@ -13,9 +13,10 @@
 //! touches before it is sent and after it is answered, whatever the
 //! answer (a change that timed out may still have been made): watch
 //! state clears all but the libraries and the playlists list; a playlist
-//! or a heart Home, the items and the playlists; a Home row Home; a
-//! pairing everything. The server's playlist, heart and library events
-//! clear what they name for every session on that server, and
+//! or a heart Home, the items and the playlists; a Home row or the
+//! recently played preferences Home; a pairing everything. The server's
+//! playlist, heart and library events clear what they name for every
+//! session on that server, and
 //! [`crate::Client::watch_changed`] the items it is given, their shows
 //! and Home. A read begun before a clear is not kept. Nothing is kept on
 //! disk.
@@ -213,7 +214,8 @@ pub(crate) fn clears(request: &Request) -> Option<Clear> {
         | R::Unlike { .. }
         | R::SyncOfflinePlays { .. } => Clear::Items,
         R::PinPlaylist { .. } | R::UnpinPlaylist { .. } | R::DismissPinNotes => Clear::Pins,
-        R::SetServerRow { .. } => Clear::Home,
+        // How Home's "Recently played" row shows each kind.
+        R::SetServerRow { .. } | R::SetRecentlyPlayedPreferences { .. } => Clear::Home,
         R::PairServer(_) | R::ShareLibraries(_) | R::LeaveServer | R::Logout => Clear::Everything,
         _ => return None,
     })
@@ -774,6 +776,16 @@ mod tests {
         );
         assert_eq!(clears(&Request::Item { id }), None);
         assert_eq!(clears(&Request::DismissPinNotes), Some(Clear::Pins));
+        let hidden = spoolframe_protocol::recently_played::RecentlyPlayedPreferences {
+            music: spoolframe_protocol::recently_played::RecentMusicMode::Hidden,
+            ..Default::default()
+        };
+        assert_eq!(
+            clears(&Request::SetRecentlyPlayedPreferences {
+                preferences: hidden
+            }),
+            Some(Clear::Home)
+        );
         assert!(Clear::Items.clears(&CatalogKey::Home));
         assert!(!Clear::Items.clears(&CatalogKey::Libraries));
         assert!(!Clear::Home.clears(&CatalogKey::Libraries));

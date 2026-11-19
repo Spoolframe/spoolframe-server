@@ -57,6 +57,7 @@ async fn start(client: &TestClient, session: &SessionId, start_ms: Option<u64>) 
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await
@@ -2141,6 +2142,7 @@ async fn an_hls_playback_carries_its_subtitle_as_a_webvtt_rendition() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -2221,6 +2223,7 @@ async fn an_hls_playback_reads_a_vobsub_or_dvb_track_into_its_webvtt_rendition()
                     display: None,
                     capabilities: None,
                     onward_share: None,
+                    source: None,
                 },
             )
             .await;
@@ -2464,6 +2467,7 @@ async fn a_burned_in_subtitle_shows_in_the_picture_where_it_was_placed() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -2662,6 +2666,7 @@ async fn burned_sidecar(
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -2774,6 +2779,7 @@ async fn a_copied_pgs_file_beside_the_film_keeps_its_cues_times() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -2843,6 +2849,7 @@ async fn a_copied_vobsub_file_beside_the_film_is_in_the_output() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -2999,6 +3006,7 @@ async fn start_for(
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -3172,6 +3180,7 @@ async fn start_on_behalf(
                 display: None,
                 capabilities,
                 onward_share,
+                source: None,
             },
         )
         .await;
@@ -3518,6 +3527,7 @@ async fn an_hls_playback_of_an_external_subtitle_carries_it_in_the_rendition_alo
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;

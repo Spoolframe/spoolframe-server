@@ -126,6 +126,7 @@ async fn a_locked_session_gets_nothing_on_any_stream() {
             display: None,
             capabilities: None,
             onward_share: None,
+            source: None,
         },
     )
     .await
@@ -171,6 +172,7 @@ async fn a_locked_session_gets_nothing_on_any_stream() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             }
         )
         .await,

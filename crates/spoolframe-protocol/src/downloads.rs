@@ -485,6 +485,10 @@ pub struct OfflinePlay {
     /// How much of it was played: the server judges by its rules whether
     /// it counts as a play.
     pub played_ms: u64,
+    /// Where it was started ([`crate::recently_played::PlaySource`]); left
+    /// out, none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::recently_played::PlaySource>,
 }
 
 /// A track liked or unliked on a device with no server

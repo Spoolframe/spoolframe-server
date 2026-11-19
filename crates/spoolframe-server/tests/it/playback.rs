@@ -35,6 +35,7 @@ async fn start(client: &TestClient, session: &SessionId, selection: Selection) -
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await
@@ -68,6 +69,7 @@ async fn a_start_s_capabilities_plan_it_in_place_of_hello_s() {
         display: None,
         capabilities,
         onward_share: None,
+        source: None,
     };
     let unplanned = client.call(Some(&session), start(None)).await;
     assert!(
@@ -887,6 +889,7 @@ async fn mutation_ids_survive_reconnect_and_reject_changed_payloads() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         },
         operation: Some(client.operation()),

@@ -609,6 +609,8 @@ impl Federation {
                         display: start.display,
                         capabilities: start.capabilities,
                         onward_share: start.onward_share,
+                        // This server's own, kept with its play here.
+                        source: None,
                     },
                     None,
                 )

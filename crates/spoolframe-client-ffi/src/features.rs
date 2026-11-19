@@ -4,16 +4,18 @@
 //! invite's server, `SpoolClient.invited_october_2026(link)`, both of
 //! `spoolframe:october-2026`. Off, the first is `None` and the second
 //! `FeatureOff`, and nothing gated is sent. `download_addons()` is
-//! `spoolframe:download-addons`'s, as `october_2026()` is, and
-//! `diagnostics()` `spoolframe:diagnostics`'s.
+//! `spoolframe:download-addons`'s, as `october_2026()` is,
+//! `diagnostics()` `spoolframe:diagnostics`'s, and `recently_played_row()`
+//! `spoolframe:recently-played-row`'s.
 
 use std::sync::Arc;
 
-use spoolframe_client_sdk::gate::{Diagnostics, DownloadAddons, October2026};
+use spoolframe_client_sdk::gate::{Diagnostics, DownloadAddons, October2026, RecentlyPlayedRow};
 use spoolframe_client_sdk::types::{Item, MediaId};
 use spoolframe_client_sdk::{
     self as sdk, DiagnosticsReport, DownloadAddonOptions, DownloadTrack, Feature,
-    FinishPasskeyRegistration, LocalDownload, NextMode, PasskeyCreation,
+    FinishPasskeyRegistration, LocalDownload, NextMode, PasskeyCreation, RecentCard,
+    RecentlyPlayedPreferences,
 };
 
 use crate::client::SpoolClient;
@@ -101,6 +103,39 @@ impl DiagnosticsApi {
     pub async fn send(&self, report: DiagnosticsReport) -> Result<String, SpoolError> {
         let on = self.0.clone();
         Ok(run(async move { on.send_diagnostics(&report).await }).await?)
+    }
+}
+
+/// The calls of `spoolframe:recently-played-row` in a session: Home's
+/// one "Recently played" row of every kind, and how each kind shows in it.
+#[derive(uniffi::Object)]
+pub struct RecentlyPlayedRowApi(sdk::On<RecentlyPlayedRow>);
+
+#[uniffi::export]
+impl RecentlyPlayedRowApi {
+    /// Home's "Recently played" row, newest first, at most `limit` (50)
+    /// cards: films, shows, seasons or episodes, and albums, playlists or
+    /// tracks, as the user's preferences say. Empty when they hid every
+    /// kind: then show no row.
+    pub async fn recently_played_row(&self, limit: u32) -> Result<Vec<RecentCard>, SpoolError> {
+        let on = self.0.clone();
+        Ok(run(async move { on.recently_played_row(limit).await }).await?)
+    }
+
+    /// How each kind shows in the row; the defaults if they set none.
+    pub async fn preferences(&self) -> Result<RecentlyPlayedPreferences, SpoolError> {
+        let on = self.0.clone();
+        Ok(run(async move { on.recently_played_preferences().await }).await?)
+    }
+
+    /// Keep `preferences` as the user's, on every device of theirs. They
+    /// change only what the row shows: every play is still counted.
+    pub async fn set_preferences(
+        &self,
+        preferences: RecentlyPlayedPreferences,
+    ) -> Result<(), SpoolError> {
+        let on = self.0.clone();
+        Ok(run(async move { on.set_recently_played_preferences(preferences).await }).await?)
     }
 }
 
@@ -192,6 +227,16 @@ impl SpoolSession {
             .feature::<Diagnostics>()
             .ok()
             .map(|on| Arc::new(DiagnosticsApi(on)))
+    }
+
+    /// `spoolframe:recently-played-row`: Home's one "Recently played" row
+    /// and its preferences; `None` when the feature is off for this
+    /// connection: build the row from `recently_played` as before.
+    pub fn recently_played_row(&self) -> Option<Arc<RecentlyPlayedRowApi>> {
+        self.session
+            .feature::<RecentlyPlayedRow>()
+            .ok()
+            .map(|on| Arc::new(RecentlyPlayedRowApi(on)))
     }
 }
 

@@ -939,6 +939,7 @@ pub(super) async fn delete_principal_rows(
         "DELETE FROM continue_hidden WHERE principal = ?1",
         "DELETE FROM track_overrides WHERE principal = ?1",
         "DELETE FROM track_preferences WHERE principal = ?1",
+        "DELETE FROM recently_played_preferences WHERE principal = ?1",
         "DELETE FROM playlists WHERE owner = ?1",
         "DELETE FROM playlist_shares WHERE principal = ?1",
         "DELETE FROM playlist_pins WHERE principal = ?1",

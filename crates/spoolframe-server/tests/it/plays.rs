@@ -99,6 +99,7 @@ async fn start(
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await;
@@ -472,6 +473,8 @@ async fn a_user_who_leaves_takes_their_plays() {
                 endpoint_id: None,
                 device_name: None,
                 playback_id: None,
+                source: None,
+                season_id: None,
             },
         )
         .await
@@ -645,6 +648,8 @@ async fn a_start_brings_plays_under_an_earlier_key_over() {
                 endpoint_id: None,
                 device_name: None,
                 playback_id: None,
+                source: None,
+                season_id: None,
             },
         )
         .await

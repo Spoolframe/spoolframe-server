@@ -61,6 +61,13 @@ pub enum Feature {
     /// Not dated, as `spoolframe:diagnostics` is not: a feature of its
     /// own that an app names without the rest of a month's.
     PhoneSignIn,
+    /// `spoolframe:recently-played-row`: `RecentlyPlayedRow`, Home's one
+    /// "Recently played" row of every kind, music by where each play was
+    /// started ([`crate::recently_played`]), and
+    /// `RecentlyPlayedPreferences` and `SetRecentlyPlayedPreferences`,
+    /// how each kind shows in it. Named for what it brings, as
+    /// `spoolframe:diagnostics` is.
+    RecentlyPlayedRow,
 }
 
 /// A set of features: [`Features::all`] is every one this build knows,
@@ -76,6 +83,7 @@ impl Feature {
             Feature::DownloadAddons => "spoolframe:download-addons",
             Feature::Diagnostics => "spoolframe:diagnostics",
             Feature::PhoneSignIn => "spoolframe:phone-sign-in",
+            Feature::RecentlyPlayedRow => "spoolframe:recently-played-row",
         }
     }
 

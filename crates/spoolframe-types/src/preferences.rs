@@ -138,6 +138,74 @@ pub enum BitmapPreference {
     Text,
 }
 
+/// How the user's music shows in Home's "Recently played" row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(rename_all = "snake_case")]
+pub enum RecentMusicMode {
+    /// By where each play was started: the playlist, the album, or the
+    /// track when it was queued by hand. A play with no source (one from
+    /// before sources were kept) shows its album.
+    #[default]
+    Sources,
+    /// Each track played, its own card.
+    Tracks,
+    /// Each track played folded into its album, whatever its source.
+    Albums,
+    /// No music in the row.
+    Hidden,
+    /// A choice this build does not know: read as [`Self::Sources`].
+    #[serde(other)]
+    Unknown,
+}
+
+/// How the user's shows show in Home's "Recently played" row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(rename_all = "snake_case")]
+pub enum RecentShowsMode {
+    /// One card for the show, at its latest episode played.
+    Show,
+    /// One card for each season played.
+    Season,
+    /// Each episode played, its own card.
+    #[default]
+    Episode,
+    /// No shows in the row.
+    Hidden,
+    /// A choice this build does not know: read as [`Self::Episode`].
+    #[serde(other)]
+    Unknown,
+}
+
+/// How the user's films show in Home's "Recently played" row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(rename_all = "snake_case")]
+pub enum RecentMoviesMode {
+    /// Each film played, its own card.
+    #[default]
+    Movie,
+    /// No films in the row.
+    Hidden,
+    /// A choice this build does not know: read as [`Self::Movie`].
+    #[serde(other)]
+    Unknown,
+}
+
+/// How each kind shows in a user's Home "Recently played" row, kept on
+/// the server for every device of theirs (`RecentlyPlayedPreferences` and
+/// `SetRecentlyPlayedPreferences` in `spoolframe-protocol`). It only
+/// changes what the row shows: every play is recorded and counted
+/// whatever it says. Every field is required on the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct RecentlyPlayedPreferences {
+    pub music: RecentMusicMode,
+    pub shows: RecentShowsMode,
+    pub movies: RecentMoviesMode,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

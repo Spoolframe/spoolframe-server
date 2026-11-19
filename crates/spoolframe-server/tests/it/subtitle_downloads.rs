@@ -275,6 +275,7 @@ async fn play(client: &TestClient, session: &SessionId, subtitle: u32) -> Playba
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await
@@ -612,6 +613,7 @@ async fn a_download_is_carried_into_a_converted_file() {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await

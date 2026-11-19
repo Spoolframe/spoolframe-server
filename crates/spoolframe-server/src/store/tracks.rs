@@ -25,14 +25,21 @@ fn parse<T: serde::de::DeserializeOwned>(what: &str, json: &str) -> Option<T> {
 /// second set of structs that must follow every new field. Rows are
 /// written whole by `set_track_preferences`, so a read rewrites nothing.
 fn parse_preferences(json: &str) -> Option<TrackPreferences> {
-    let stored: serde_json::Value = parse("track preferences", json)?;
-    let mut full =
-        serde_json::to_value(TrackPreferences::default()).expect("preferences always serialize");
+    parse_over_defaults("track preferences", json)
+}
+
+/// A stored document of `what` laid over `T::default()`, as
+/// [`parse_preferences`] lays track preferences: the music preferences
+/// are kept the same way.
+pub(super) fn parse_over_defaults<T>(what: &str, json: &str) -> Option<T>
+where
+    T: Default + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let stored: serde_json::Value = parse(what, json)?;
+    let mut full = serde_json::to_value(T::default()).expect("preferences always serialize");
     overlay(&mut full, stored);
     serde_json::from_value(full)
-        .inspect_err(|e| {
-            tracing::warn!(what = "track preferences", error = %e, "ignoring an unreadable stored document")
-        })
+        .inspect_err(|e| tracing::warn!(what, error = %e, "ignoring an unreadable stored document"))
         .ok()
 }
 

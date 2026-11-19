@@ -10,8 +10,9 @@
 use dioxus::prelude::*;
 use serde_json::Value;
 use spoolframe_admin_api::{
-    DeviceEntry, MeApiClient, PasskeyEntry, PasskeyHost, PasswordChange, Role, SessionEntry,
-    SsoLink, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo, UserInfo, error_code,
+    DeviceEntry, MeApiClient, PasskeyEntry, PasskeyHost, PasswordChange, RecentlyPlayedPreferences,
+    Role, SessionEntry, SsoLink, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
+    UserInfo, error_code,
 };
 
 use super::admin::{Said, Toast, say};
@@ -21,8 +22,9 @@ use crate::logic::{
     passkey_title, password_remove_error,
 };
 use crate::preferences::{
-    self, FORCED, PICTURE_SUBTITLES, SDH, SUBTITLE_MODES, audio_choices, avoids_extras, index_of,
-    override_line, picture_row, subtitle_choices,
+    self, FORCED, PICTURE_SUBTITLES, RECENT_MOVIES, RECENT_MUSIC, RECENT_SHOWS, SDH,
+    SUBTITLE_MODES, audio_choices, avoids_extras, index_of, override_line, picture_row,
+    subtitle_choices,
 };
 use crate::sso::Tone;
 use crate::trust::{self, Change, Icon, LegendLine, Question, Row, Switch, Whose};
@@ -1721,6 +1723,7 @@ fn Playback() -> Element {
                     Some(Err(text)) => rsx! { Alert { text } },
                     None => rsx! {},
                 }
+                RecentlyPlayedRows {}
                 div { class: "row-label", "For one series or movie" }
                 match picks {
                     None => rsx! { p { class: "m-0 text-sm text-ctp-subtext0", "Loading…" } },
@@ -1753,6 +1756,123 @@ fn Playback() -> Element {
                     },
                 }
             }
+        }
+    }
+}
+
+async fn recently_played_preferences() -> Result<RecentlyPlayedPreferences, ApiError> {
+    let client = rpc::client().await?;
+    client
+        .recently_played_preferences()
+        .await
+        .map_err(rpc::error)
+}
+
+/// The value at index `value` of `choices`, if it is one.
+fn chosen<T: Copy>(choices: &[(T, &str)], value: &str) -> Option<T> {
+    value
+        .parse()
+        .ok()
+        .and_then(|i: usize| choices.get(i))
+        .map(|(v, _)| *v)
+}
+
+/// Home's "Recently played" row: how music, shows and films each show in
+/// it in every app of the user's, saved as each is chosen. Plays are
+/// recorded and counted whatever it says.
+#[component]
+fn RecentlyPlayedRows() -> Element {
+    let mut loaded = use_resource(recently_played_preferences);
+    let mut failed = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let save = use_callback(move |preferences: RecentlyPlayedPreferences| {
+        busy.set(true);
+        spawn(async move {
+            let saved = async {
+                let client = rpc::client().await?;
+                client
+                    .set_recently_played_preferences(preferences)
+                    .await
+                    .map_err(rpc::error)
+            };
+            failed.set(saved.await.err().map(|e| e.explain()));
+            loaded.restart();
+            busy.set(false);
+        });
+    });
+    let current = loaded.read().clone();
+    rsx! {
+        match current {
+            None => rsx! {},
+            Some(Err(e)) => rsx! { Alert { text: e.explain() } },
+            Some(Ok(p)) => {
+                let music = index_of(RECENT_MUSIC, &p.music);
+                let shows = index_of(RECENT_SHOWS, &p.shows);
+                let movies = index_of(RECENT_MOVIES, &p.movies);
+                rsx! {
+                    div { class: "row-label", "Recently played" }
+                    p { class: "m-0 text-xs text-ctp-subtext0",
+                        "What the row shows. Every play still counts, hidden or not."
+                    }
+                    div { class: "row",
+                        span { class: "row-what", b { "Music" } }
+                        span { class: "row-do",
+                            select {
+                                class: "pref-select",
+                                aria_label: "Music in Recently played",
+                                disabled: busy(),
+                                onchange: move |e: FormEvent| {
+                                    if let Some(music) = chosen(RECENT_MUSIC, &e.value()) {
+                                        save.call(RecentlyPlayedPreferences { music, ..p });
+                                    }
+                                },
+                                for (i, (_, label)) in RECENT_MUSIC.iter().enumerate() {
+                                    option { value: "{i}", selected: i == music, "{label}" }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "row",
+                        span { class: "row-what", b { "Shows" } }
+                        span { class: "row-do",
+                            select {
+                                class: "pref-select",
+                                aria_label: "Shows in Recently played",
+                                disabled: busy(),
+                                onchange: move |e: FormEvent| {
+                                    if let Some(shows) = chosen(RECENT_SHOWS, &e.value()) {
+                                        save.call(RecentlyPlayedPreferences { shows, ..p });
+                                    }
+                                },
+                                for (i, (_, label)) in RECENT_SHOWS.iter().enumerate() {
+                                    option { value: "{i}", selected: i == shows, "{label}" }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "row",
+                        span { class: "row-what", b { "Movies" } }
+                        span { class: "row-do",
+                            select {
+                                class: "pref-select",
+                                aria_label: "Movies in Recently played",
+                                disabled: busy(),
+                                onchange: move |e: FormEvent| {
+                                    if let Some(movies) = chosen(RECENT_MOVIES, &e.value()) {
+                                        save.call(RecentlyPlayedPreferences { movies, ..p });
+                                    }
+                                },
+                                for (i, (_, label)) in RECENT_MOVIES.iter().enumerate() {
+                                    option { value: "{i}", selected: i == movies, "{label}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(text) = failed() {
+            Alert { text }
         }
     }
 }

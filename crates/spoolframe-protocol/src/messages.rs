@@ -374,6 +374,11 @@ pub enum Request {
         /// server's own share. Left out, this server's share alone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         onward_share: Option<u64>,
+        /// Where a track's play was started ([`crate::recently_played`]),
+        /// kept with its play for Home's "Recently played" row. Needs no
+        /// feature; left out, the play has no source and shows its album.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<crate::recently_played::PlaySource>,
     },
     /// End a playback now, and any encode for it.
     StopPlayback {
@@ -1331,6 +1336,26 @@ pub enum Request {
         remember: bool,
     },
 
+    /// Home's one "Recently played" row of every kind (feature
+    /// `spoolframe:recently-played-row`): `RecentlyPlayedRow`, at most
+    /// `limit` cards ([`crate::recently_played::MAX_ROW`]), newest first,
+    /// each once, at its latest counted play, as the user's
+    /// `RecentlyPlayedPreferences` say. A kind they hid is left out; with
+    /// every kind hidden the answer is empty, and the app shows no row. A
+    /// playlist the user no longer sees shows the play's album instead.
+    RecentlyPlayedRow {
+        limit: u32,
+    },
+    /// How each kind shows in the user's row (feature
+    /// `spoolframe:recently-played-row`): `RecentlyPlayedPreferences`; the
+    /// defaults if they set none.
+    RecentlyPlayedPreferences,
+    /// Keep `preferences` as the user's (feature
+    /// `spoolframe:recently-played-row`): `Done`.
+    SetRecentlyPlayedPreferences {
+        preferences: crate::recently_played::RecentlyPlayedPreferences,
+    },
+
     /// A request type this build does not know; answered with
     /// [`Error::Unsupported`].
     #[serde(other)]
@@ -1394,6 +1419,9 @@ impl Request {
             | Request::PrepareAudioAddon { .. } => Some(Feature::DownloadAddons),
             Request::SendDiagnostics { .. } => Some(Feature::Diagnostics),
             Request::OfferDeviceSignIn { .. } => Some(Feature::PhoneSignIn),
+            Request::RecentlyPlayedRow { .. }
+            | Request::RecentlyPlayedPreferences
+            | Request::SetRecentlyPlayedPreferences { .. } => Some(Feature::RecentlyPlayedRow),
             Request::Hello { .. }
             | Request::AuthMethods
             | Request::LoginPassword { .. }
@@ -1938,6 +1966,14 @@ pub enum Reply {
     DeviceSignInOffered {
         request: String,
         expires_in_ms: u64,
+    },
+    /// Home's "Recently played" row (`RecentlyPlayedRow`).
+    RecentlyPlayedRow {
+        cards: Vec<crate::recently_played::RecentCard>,
+    },
+    /// How each kind shows in the row (`RecentlyPlayedPreferences`).
+    RecentlyPlayedPreferences {
+        preferences: crate::recently_played::RecentlyPlayedPreferences,
     },
     /// What an invite's code is (`LookupInvite`).
     InviteLookup {

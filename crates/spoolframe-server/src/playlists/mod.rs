@@ -2766,6 +2766,7 @@ fn new_entry(item: &Item, external_ids: Vec<String>) -> NewEntry {
 
 pub mod people;
 pub mod plex_import;
+mod recently_played_row;
 
 #[cfg(test)]
 mod tests;

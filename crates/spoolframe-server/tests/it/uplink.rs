@@ -53,6 +53,7 @@ async fn a_device_on_the_lan_is_neither_counted_nor_capped() {
                     display: None,
                     capabilities: None,
                     onward_share: None,
+                    source: None,
                 },
             )
             .await;
@@ -99,6 +100,7 @@ async fn start(client: &TestClient, session: &SessionId) -> Response {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             },
         )
         .await

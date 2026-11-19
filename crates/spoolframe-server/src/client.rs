@@ -77,7 +77,11 @@ use spoolframe_types::Delivery;
 /// client's `Hello` named. A feature not here is off for every
 /// connection, though this build knows its name.
 pub(crate) fn features() -> Features {
-    Feature::October2026 | Feature::DownloadAddons | Feature::Diagnostics | Feature::PhoneSignIn
+    Feature::October2026
+        | Feature::DownloadAddons
+        | Feature::Diagnostics
+        | Feature::PhoneSignIn
+        | Feature::RecentlyPlayedRow
 }
 
 /// How long shutdown waits to deliver `ShuttingDown` to one client.
@@ -3939,6 +3943,8 @@ impl ClientProtocol {
                     title_key: self.services.watch.title_key(&found).await,
                     item: found.item,
                     from: position,
+                    // A paired server's report says nothing of it.
+                    source: None,
                 };
                 // Played through this server (P8-04), its playback keeps
                 // its play: a report besides opens no second one.
@@ -4152,6 +4158,33 @@ impl ClientProtocol {
                     .map_err(internal)?;
                 Ok(Reply::Done)
             }
+            Request::RecentlyPlayedRow { limit } => {
+                let cards = self
+                    .services
+                    .playlists
+                    .recently_played_row(
+                        &actor,
+                        limit.min(spoolframe_protocol::recently_played::MAX_ROW),
+                        federation.is_some(),
+                    )
+                    .await
+                    .map_err(playlists_error)?;
+                Ok(Reply::RecentlyPlayedRow { cards })
+            }
+            Request::RecentlyPlayedPreferences => Ok(Reply::RecentlyPlayedPreferences {
+                preferences: self
+                    .store()
+                    .recently_played_preferences(principal)
+                    .await
+                    .map_err(internal)?,
+            }),
+            Request::SetRecentlyPlayedPreferences { preferences } => {
+                self.store()
+                    .set_recently_played_preferences(principal, &preferences)
+                    .await
+                    .map_err(internal)?;
+                Ok(Reply::Done)
+            }
             Request::SetTrackOverride { id, selection } => {
                 let (_, descriptor) = self.describe(&id).await?;
                 let override_ = TrackOverride::from_selection(&descriptor.tracks(), selection);
@@ -4216,6 +4249,7 @@ impl ClientProtocol {
                 display,
                 capabilities: device,
                 onward_share,
+                source,
             } => {
                 // A paired server's item the device could not reach it
                 // for: played from there through this server (P8-04).
@@ -4240,6 +4274,7 @@ impl ClientProtocol {
                                 onward_share: None,
                                 device: connection.remote_id(),
                             },
+                            source,
                         )
                         .await;
                 }
@@ -4406,6 +4441,7 @@ impl ClientProtocol {
                                 duration,
                                 credits,
                                 from: start.unwrap_or_default(),
+                                source,
                             },
                         },
                     );
@@ -5430,6 +5466,7 @@ impl ClientProtocol {
                                 played: Duration::from_millis(play.played_ms),
                                 endpoint_id: Some(&endpoint),
                                 device_name: hello.device_name.as_deref(),
+                                source: play.source.as_ref(),
                             },
                         )
                         .await
@@ -7279,6 +7316,9 @@ impl ClientProtocol {
         federation: &Arc<crate::federation::Federation>,
         (session, who): (&SessionId, &Who),
         mut start: crate::federation::ProxyStart,
+        // Where its play was started, kept here with it: the paired server
+        // knows nothing of this server's playlists.
+        source: Option<spoolframe_protocol::recently_played::PlaySource>,
     ) -> Result<Reply, Error> {
         let requested = std::time::Instant::now();
         let id = start.item.clone();
@@ -7358,6 +7398,7 @@ impl ClientProtocol {
                     duration,
                     credits: spoolframe_policy::watch::credits_to_end(&found.markers),
                     from,
+                    source,
                 },
             },
         );

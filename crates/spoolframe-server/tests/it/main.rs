@@ -82,6 +82,7 @@ mod sdk_downloads;
 mod sdk_music;
 mod sdk_music_hls;
 mod sdk_phone_sign_in;
+mod sdk_recently_played_row;
 mod search;
 mod server_addresses;
 mod server_lookup;

@@ -25,7 +25,7 @@ use spoolframe_protocol::playlists::{
 };
 
 use crate::playlist_edits::Edited;
-use crate::{SdkError, Session};
+use crate::{PlaySource, SdkError, Session};
 
 /// Fewer entries ahead than this, and the lineup asks for more.
 pub const TOP_UP_BELOW: usize = 20;
@@ -271,6 +271,14 @@ impl PlaylistCursor {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Where its entries' plays were started, for
+    /// [`crate::PlaybackOptions::source`]: this playlist.
+    pub fn source(&self) -> PlaySource {
+        PlaySource::Playlist {
+            id: self.id.clone(),
+        }
     }
 
     /// The entry playing.
@@ -789,6 +797,13 @@ pub(crate) mod tests {
         assert_eq!(cursor.current().map(|e| e.entry), Some(1));
         assert_eq!(cursor.ahead().len(), 4);
         assert_eq!(server.calls(), ["play None", "upcoming"]);
+    }
+
+    #[tokio::test]
+    async fn a_followed_playlist_s_plays_are_from_it() {
+        let server = Server::new(2);
+        let cursor = follow(&server, PlayFrom::Place, PlaySettings::default()).await;
+        assert_eq!(cursor.source(), PlaySource::Playlist { id: "p".into() });
     }
 
     /// Entry 3 playing since `play_playlist`: the server's place is there.

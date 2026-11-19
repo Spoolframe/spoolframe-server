@@ -307,6 +307,7 @@ fn every_request_round_trips() {
             display: None,
             capabilities: None,
             onward_share: None,
+            source: None,
         },
         Request::StartPlayback {
             id: MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap(),
@@ -317,6 +318,7 @@ fn every_request_round_trips() {
             display: None,
             capabilities: None,
             onward_share: None,
+            source: None,
         },
         Request::StopPlayback {
             handle: crate::PlaybackHandle("h".into()),
@@ -1779,6 +1781,7 @@ fn a_start_playback_s_capabilities_round_trip_and_are_left_out_when_none() {
         display: None,
         capabilities,
         onward_share: None,
+        source: None,
     };
     let caps = spoolframe_types::ClientCapabilities {
         max_bitrate: Some(4_000_000),
@@ -1820,6 +1823,7 @@ fn a_start_playback_s_display_round_trips() {
         display: Some(display.clone()),
         capabilities: None,
         onward_share: None,
+        source: None,
     };
     let decoded: Request = codec::decode(&codec::encode(&request).unwrap()).unwrap();
     assert!(
@@ -2225,6 +2229,7 @@ fn a_request_missing_a_field_is_refused() {
             display: None,
             capabilities: None,
             onward_share: None,
+            source: None,
         },
         &["selection", "start_ms", "bitmap"],
     );
@@ -4457,6 +4462,7 @@ mod music_downloads {
                 track: track("32"),
                 at: 1_790_000_000,
                 played_ms: 240_000,
+                source: Some(crate::recently_played::PlaySource::Queued),
             }],
             liked: vec![OfflineLike {
                 track: track("33"),

@@ -77,6 +77,13 @@ feature!(
     PhoneSignIn = Feature::PhoneSignIn
 );
 
+feature!(
+    /// `spoolframe:recently-played-row`: Home's one "Recently played" row
+    /// of every kind, music by where each play was started, and how each
+    /// kind shows in it ([`On<RecentlyPlayedRow>`]).
+    RecentlyPlayedRow = Feature::RecentlyPlayedRow
+);
+
 /// Feature `G`'s calls in a session: [`crate::Session::feature`]. Cheap
 /// to clone.
 pub struct On<G: Gate> {

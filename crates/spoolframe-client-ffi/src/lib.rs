@@ -61,7 +61,10 @@ pub use events::{
     LibrariesNotice, LibrariesWatch, PlaybackShareWatch, PlaylistNotice, PlaylistWatch,
     ProfileNotice, ProfileWatch, SubtitleTimingNotice, SubtitleTimingWatch, UplinkShare,
 };
-pub use features::{DiagnosticsApi, October2026Api, October2026InvitedApi, diagnostics_log_limit};
+pub use features::{
+    DiagnosticsApi, October2026Api, October2026InvitedApi, RecentlyPlayedRowApi,
+    diagnostics_log_limit,
+};
 pub use markers::SpoolMarkers;
 pub use pairing::{
     Connected, Paired, PairedServer, SpoolHeldPairing, SpoolPairing, SpoolPairingOffer,

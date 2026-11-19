@@ -4374,6 +4374,8 @@ mod replica {
                     endpoint_id: None,
                     device_name: None,
                     playback_id: None,
+                    source: None,
+                    season_id: None,
                 },
             )
             .await
@@ -4883,6 +4885,7 @@ mod replica {
                 display: None,
                 capabilities: None,
                 onward_share: None,
+                source: None,
             }
         }
 

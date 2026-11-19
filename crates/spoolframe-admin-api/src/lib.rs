@@ -23,6 +23,11 @@ pub use spoolframe_types::{
     SubtitleOrigin, SubtitleResult, SubtitleRole, SubtitleSearch, SubtitleSource,
     SubtitleSourceState, SubtitleSourceStatus, SubtitleTrack, Track, TrackPreferences,
 };
+// How each kind shows in the caller's Home "Recently played" row
+// (`recentlyPlayedPreferences`).
+pub use spoolframe_types::{
+    RecentMoviesMode, RecentMusicMode, RecentShowsMode, RecentlyPlayedPreferences,
+};
 // A library sorted and filtered as clients ask it (`catalogRows`,
 // `catalogFilterValues`).
 pub use spoolframe_types::{
@@ -3707,6 +3712,21 @@ pub trait MeApi {
     async fn set_track_preferences(
         &self,
         preferences: TrackPreferences,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// How each kind shows in the caller's Home "Recently played" row, as
+    /// their apps read it; the defaults if they set none. It changes only
+    /// what the row shows: every play is recorded and counted.
+    #[method(name = "recentlyPlayedPreferences", with_extensions)]
+    async fn recently_played_preferences(
+        &self,
+    ) -> jsonrpsee::core::RpcResult<RecentlyPlayedPreferences>;
+
+    /// Replace them, for every device of the caller's.
+    #[method(name = "setRecentlyPlayedPreferences", with_extensions)]
+    async fn set_recently_played_preferences(
+        &self,
+        preferences: RecentlyPlayedPreferences,
     ) -> jsonrpsee::core::RpcResult<()>;
 
     /// What the caller picked for each series or movie, most recent first.

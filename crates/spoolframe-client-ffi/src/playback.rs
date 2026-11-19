@@ -886,8 +886,10 @@ impl SpoolSession {
     /// reaches the device, kept for its re-plans and restarts; `None` is
     /// the first way `DeviceSpec.capabilities` lists. `audio`: the sound
     /// it may carry, in place of `DeviceSpec.capabilities`', kept as
-    /// `delivery` is and sent with it; `None` is the device's.
-    #[uniffi::method(default(delivery = None, audio = None))]
+    /// `delivery` is and sent with it; `None` is the device's. `source`:
+    /// where a track's play was started (its album, its playlist, or the
+    /// queue by hand), for Home's "Recently played" row; `None`, nowhere.
+    #[uniffi::method(default(delivery = None, audio = None, source = None))]
     #[allow(clippy::too_many_arguments)]
     pub async fn open_playback(
         &self,
@@ -898,8 +900,9 @@ impl SpoolSession {
         display: Option<ScreenCapabilities>,
         delivery: Option<ConversionDelivery>,
         audio: Option<AudioOutput>,
+        source: Option<sdk::PlaySource>,
     ) -> Result<Arc<SpoolPlayback>, SpoolError> {
-        let options = play_options(start, quality, display, delivery, audio);
+        let options = play_options(start, quality, display, delivery, audio, source);
         let opened = run(open(self.session.clone(), id, tracks, options)).await?;
         Ok(SpoolPlayback::new(opened))
     }
@@ -912,6 +915,7 @@ pub(crate) fn play_options(
     display: Option<ScreenCapabilities>,
     delivery: Option<ConversionDelivery>,
     audio: Option<AudioOutput>,
+    source: Option<sdk::PlaySource>,
 ) -> sdk::PlaybackOptions {
     sdk::PlaybackOptions {
         start,
@@ -919,6 +923,7 @@ pub(crate) fn play_options(
         display: display.map(Into::into),
         delivery,
         audio: audio.map(Into::into),
+        source,
         ..Default::default()
     }
 }

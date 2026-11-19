@@ -278,6 +278,11 @@ impl Plays {
         let item = played.item.clone();
         let title = played.title_key.clone();
         let duration_ms = played.duration.map(ms);
+        // Only a track's: a film's or an episode's means nothing.
+        let source = played
+            .source
+            .clone()
+            .filter(|_| matches!(played.item, Item::Track(_)));
         runtime.spawn(async move {
             let id = item.id();
             if let Err(e) = watch.relink(principal, id, &title).await {
@@ -293,6 +298,10 @@ impl Plays {
                 ),
                 _ => (None, None, None),
             };
+            let season_id = match &item {
+                Item::Episode(e) => Some(e.season_id.to_string()),
+                _ => None,
+            };
             let new = NewPlay {
                 media_id: &media_id,
                 kind,
@@ -304,6 +313,8 @@ impl Plays {
                 endpoint_id: Some(&endpoint_id),
                 device_name: device_name.as_deref(),
                 playback_id: playback_id.as_deref(),
+                source: source.as_ref(),
+                season_id: season_id.as_deref(),
             };
             match watch.store.open_play(principal, new).await {
                 Ok(row) => *opening = Some(row),
@@ -374,6 +385,8 @@ pub struct OfflinePlay<'a> {
     /// The device: its endpoint id, and the name it gave.
     pub endpoint_id: Option<&'a str>,
     pub device_name: Option<&'a str>,
+    /// Where it was started.
+    pub source: Option<&'a spoolframe_protocol::recently_played::PlaySource>,
 }
 
 impl Watch {
@@ -435,6 +448,8 @@ impl Watch {
                     endpoint_id: play.endpoint_id,
                     device_name: play.device_name,
                     playback_id: Some(&key),
+                    source: play.source,
+                    season_id: None,
                 },
                 (ended.saturating_sub(played_secs), ended),
                 ms(play.played),

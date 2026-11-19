@@ -33,7 +33,8 @@ use spoolframe_admin_api::{
     ArtworkInfo, CatalogItem, CatalogLibrary, CatalogPage, CatalogQuery, CatalogRow, PathsChecked,
 };
 use spoolframe_admin_api::{
-    AudioPick, SsoLink, SubtitlePick, TrackOverrideEntry, TrackPreferences, TrackPreferencesInfo,
+    AudioPick, RecentlyPlayedPreferences, SsoLink, SubtitlePick, TrackOverrideEntry,
+    TrackPreferences, TrackPreferencesInfo,
 };
 use spoolframe_admin_api::{AuditEvent, AuditPage, ConnectedApp};
 use spoolframe_admin_api::{ConfigReload, UplinkMeasurement};
@@ -2729,6 +2730,31 @@ impl MeApiServer for AdminApi {
             .map_err(internal)
     }
 
+    async fn recently_played_preferences(
+        &self,
+        ext: &Extensions,
+    ) -> RpcResult<RecentlyPlayedPreferences> {
+        let (_, user) = self.caller(ext).await?;
+        self.auth
+            .store()
+            .recently_played_preferences(Principal::LocalUser(user.user))
+            .await
+            .map_err(internal)
+    }
+
+    async fn set_recently_played_preferences(
+        &self,
+        ext: &Extensions,
+        preferences: RecentlyPlayedPreferences,
+    ) -> RpcResult<()> {
+        let (_, user) = self.caller(ext).await?;
+        self.auth
+            .store()
+            .set_recently_played_preferences(Principal::LocalUser(user.user), &preferences)
+            .await
+            .map_err(internal)
+    }
+
     async fn track_overrides(&self, ext: &Extensions) -> RpcResult<Vec<TrackOverrideEntry>> {
         let (_, user) = self.caller(ext).await?;
         let overrides = self
@@ -5155,6 +5181,28 @@ mod tests {
         let read = api.track_preferences(&ext).await.unwrap();
         assert!(read.ocr_offered);
         assert_eq!(read.preferences, TrackPreferences::default());
+    }
+
+    /// The web page's setting is the one the apps read: the same row.
+    #[tokio::test]
+    async fn the_recently_played_preferences_set_on_the_web_are_the_apps() {
+        let (api, ext, _, _dir) = api_with_alice("recently-played-preferences-web").await;
+        let hidden = RecentlyPlayedPreferences {
+            music: spoolframe_admin_api::RecentMusicMode::Hidden,
+            ..RecentlyPlayedPreferences::default()
+        };
+        api.set_recently_played_preferences(&ext, hidden)
+            .await
+            .unwrap();
+        let (_, user) = api.caller(&ext).await.unwrap();
+        assert_eq!(
+            api.auth
+                .store()
+                .recently_played_preferences(Principal::LocalUser(user.user))
+                .await
+                .unwrap(),
+            hidden
+        );
     }
 
     #[tokio::test]

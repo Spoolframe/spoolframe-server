@@ -142,6 +142,7 @@ async fn start(server: &TestServer, device: &Device, id: &MediaId) -> PlaybackHa
                 display: None,
                 capabilities: Some(capabilities),
                 onward_share: None,
+                source: None,
             },
         )
         .await;

@@ -7,8 +7,8 @@
 //! changes what was set.
 
 use spoolframe_admin_api::{
-    AudioPick, AudioRole, BitmapPreference, ForcedPreference, SdhPreference, SubtitleMode,
-    SubtitlePick, SubtitleRole, TrackOverrideEntry,
+    AudioPick, AudioRole, BitmapPreference, ForcedPreference, RecentMoviesMode, RecentMusicMode,
+    RecentShowsMode, SdhPreference, SubtitleMode, SubtitlePick, SubtitleRole, TrackOverrideEntry,
 };
 
 /// What stands for the item's original language in an audio list.
@@ -132,6 +132,28 @@ pub const SUBTITLE_MODES: &[(SubtitleMode, &str)] = &[
     (SubtitleMode::ForeignOnly, "When the audio is foreign"),
     (SubtitleMode::Always, "Always"),
     (SubtitleMode::Off, "Off"),
+];
+
+/// How music shows in Home's "Recently played" row, in every app.
+pub const RECENT_MUSIC: &[(RecentMusicMode, &str)] = &[
+    (RecentMusicMode::Sources, "Playlist, album or queued track"),
+    (RecentMusicMode::Tracks, "Each track"),
+    (RecentMusicMode::Albums, "Each album"),
+    (RecentMusicMode::Hidden, "Hidden"),
+];
+
+/// How shows show in the row.
+pub const RECENT_SHOWS: &[(RecentShowsMode, &str)] = &[
+    (RecentShowsMode::Episode, "Each episode"),
+    (RecentShowsMode::Season, "Each season"),
+    (RecentShowsMode::Show, "Each show"),
+    (RecentShowsMode::Hidden, "Hidden"),
+];
+
+/// How films show in the row.
+pub const RECENT_MOVIES: &[(RecentMoviesMode, &str)] = &[
+    (RecentMoviesMode::Movie, "Each movie"),
+    (RecentMoviesMode::Hidden, "Hidden"),
 ];
 
 /// Subtitles for deaf and hard-of-hearing viewers.
@@ -386,5 +408,18 @@ mod tests {
         assert_eq!(index_of(SDH, &SdhPreference::Only), 3);
         assert_eq!(index_of(FORCED, &ForcedPreference::Only), 3);
         assert_eq!(index_of(FORCED, &ForcedPreference::default()), 0);
+    }
+
+    /// Each kind's default is its first choice.
+    #[test]
+    fn recently_played_lists_each_kind_s_default_first() {
+        assert_eq!(
+            (
+                index_of(RECENT_MUSIC, &RecentMusicMode::default()),
+                index_of(RECENT_SHOWS, &RecentShowsMode::default()),
+                index_of(RECENT_MOVIES, &RecentMoviesMode::default()),
+            ),
+            (0, 0, 0)
+        );
     }
 }
