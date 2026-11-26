@@ -37,6 +37,10 @@ exceptions = [
 # acceptance waiting for a crate that is not there is no reason to warn.
 unused-ignored-advisory = "allow"
 ignore = [
+  # chrono: unmaintained, not vulnerable, with no fixed version. In the
+  # SDK's graph on Windows only: iroh's netwatch reads interfaces through
+  # wmi, which requires it. deny.toml has the server's reasons.
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; in the SDK only on Windows, through iroh's netwatch and wmi, with no way to turn it off" },
   # basic-toml: unmaintained, not vulnerable. Read at build time by
   # askama's derive macro, in uniffi_bindgen: only spoolframe-client-ffi's
   # `bindgen` feature (its uniffi-bindgen bin) builds it, never the
@@ -46,9 +50,9 @@ ignore = [
   # should it come in, check that nothing does an RSA private-key
   # operation with it, which the Marvin timing attack targets.
   { id = "RUSTSEC-2023-0071", reason = "rsa accepted for signature verification only (public keys); no private-key operations" },
-  # paste: unmaintained, not vulnerable. A proc-macro run at build time
-  # (through iroh's netlink-packet-core 0.8.2); none of it is in the
-  # binary.
+  # paste: unmaintained, not vulnerable. A build-time proc-macro, in the
+  # server's graph only (foyer-memory) since iroh 1.5; kept so the list
+  # stays deny.toml's.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the SDK" },
 ]
 

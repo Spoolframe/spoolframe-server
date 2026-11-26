@@ -40,6 +40,8 @@ output with `serde_json::from_slice::<FfProbe>`.
 - The `async` feature and `ffprobe_async*` are removed. They ignored
   `Config::ffprobe_bin` (always ran `ffprobe` from `PATH`) and had no
   timeout; Spoolframe runs the process itself.
+- The optional `url` dependency needs 2.5.9 (was 2.5.8), which fixes
+  RUSTSEC-2026-0592.
 - Not copied: `tests/` (they download sample media from the Internet and
   probe it), `.github/`, and
   the upstream `Cargo.lock`.

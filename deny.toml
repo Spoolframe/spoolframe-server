@@ -70,17 +70,9 @@ ignore = [
   # fixed rsa release exists.
   { id = "RUSTSEC-2023-0071", reason = "rsa is used only to verify OIDC ID token and passkey signatures (public keys); no private-key operations" },
   # paste: unmaintained, not vulnerable. A proc-macro run at build time
-  # (through iroh's netlink-packet-core 0.8.2 and foyer-memory 0.22.6);
+  # (through foyer-memory 0.22.6; iroh 1.5 no longer brings it);
   # none of it is in the binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the server" },
-  # block-buffer below 0.12.1: a hasher reused after a panic in the middle
-  # of an update may read stale buffer state. Only in the server's graph,
-  # through digest 0.10 in openidconnect 4.1.0, oauth2 5.0.0, sqlx 0.9.0,
-  # soketto 0.8.1, and webauthn-rs 0.6.2 (crypto-glue 0.2.2, argon2 0.5,
-  # blake2 0.10), each at its latest release; every block-buffer below
-  # 0.12.1 is affected. The server never reuses a hasher after a panic.
-  # Our own sha2 is 0.11, so the SDK graph is clear.
-  { id = "GHSA-qwgh-2vcv-g2f7", reason = "block-buffer < 0.12.1 comes through digest 0.10 in openidconnect, oauth2, sqlx, soketto and webauthn-rs, all at their latest; no hasher is reused after a panic" },
 ]
 
 # Several versions of one crate come from upstream (iroh, the HTTP and

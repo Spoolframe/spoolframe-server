@@ -292,7 +292,7 @@ anyhow = "1"
 
 # Server configuration is UCL, as in kiln and steward. From crates.io, so a
 # build needs no private registry.
-uclicious = "0.10.1"
+uclicious = "0.10.2"
 
 # Reads the workspace graph for the license-boundary test.
 cargo_metadata = "0.23"

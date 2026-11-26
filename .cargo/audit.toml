@@ -8,9 +8,6 @@ ignore = [
   "RUSTSEC-2023-0071",
   # paste: unmaintained build-time proc-macro; none of it runs.
   "RUSTSEC-2024-0436",
-  # block-buffer < 0.12.1, through digest 0.10 on the server: no hasher is
-  # reused after a panic.
-  "GHSA-qwgh-2vcv-g2f7",
   # basic-toml: unmaintained; read only by askama's derive macro, at build
   # time, in the FFI crate's optional bindings generator.
   "RUSTSEC-2026-0374",
