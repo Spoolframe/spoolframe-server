@@ -22,8 +22,7 @@ stable: each minor release (0.17 → 0.18) can break it, while patch
 releases on one minor line do not. Read the CHANGELOG's BREAKING entries
 before moving to a new minor.
 
-The SDK runs on Tokio. Then add the noq-proto patch below to your
-workspace.
+The SDK runs on Tokio.
 
 ## Taking the crates from the Coldsteel registry
 
@@ -57,7 +56,7 @@ The Coldsteel copies depend on each other as crates.io crates, and a
 `[patch.crates-io]` applies to the whole graph, so with every spoolframe
 crate patched none comes from crates.io. A patch the graph does not use
 is a warning only. Remove the section to go back to crates.io; cargo drops
-`[patch]` when the app publishes, as for noq-proto below.
+`[patch]` when the app publishes.
 
 ### Taking a PR build
 
@@ -76,7 +75,7 @@ spoolframe-client-sdk = { version = "=0.17.5-gab12d3b", registry = "coldsteel" }
 
 Always use `=`. `"0.17"` does not match a PR build, but
 `"0.17.0-beta.1"` does: it matches every later pre-release of 0.17.0, so
-it can select a build from any PR. The noq-proto patch below still applies.
+it can select a build from any PR.
 These builds are for tests only: they are never on crates.io.
 
 ## Getting started
@@ -262,27 +261,3 @@ not count. People and `request.library` are not searched offline;
 `Client::search_offline_playlists(server, user_id, query)` finds the
 playlists kept, those with nothing here too. A locked profile is
 `ProfileLocked`.
-
-## noq-proto: add the patch to your app
-
-iroh's QUIC state machine, noq-proto 1.4.0, closes a connection with "too
-many gaps in stream buffer" when a stream holds more than 2,048 packets after
-a lost packet or ahead of a slow reader. No data is missing when this occurs.
-The fix is n0-computer/noq#866. It is merged but not released: 1.4.0 is the
-newest noq-proto on crates.io, and iroh 1.4.1 uses it.
-
-The SDK works without the fix: it keeps the receive window of a stream at
-2 MiB (`STREAM_WINDOW`), below the limit of 1.4.0. cargo ignores the
-`[patch]` section of a dependency, so to get the fix, add the patch to your
-own workspace's `Cargo.toml`:
-
-```toml
-[patch.crates-io]
-noq-proto = { git = "https://github.com/n0-computer/noq", rev = "3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a" }
-```
-
-That commit is noq-proto 1.5.0 from noq's `main`. It also contains #867
-(unordered streams keep unread data when compacted), the deprecation of
-`send_fairness` (#835) and `SendStream::set_affinity` (#836). The patch does
-not stop you from publishing your own crate: cargo drops `[patch]` when it
-publishes. Remove the patch when a noq-proto release contains #866.

@@ -115,25 +115,17 @@ async fn writes_work_again_once_a_full_disk_has_space() {
             .unwrap_err();
         assert_disk_full(&e.to_string());
     }
-    // The connection the failure left counted inside a transaction is
-    // closed on its way back to the pool, not handed out again: the
-    // writes below would pass on a fresh connection whether or not.
-    let closed = || {
-        store
-            .closed_in_transaction
-            .load(std::sync::atomic::Ordering::Relaxed)
-    };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while closed() == 0 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the connection left inside a transaction was not closed");
-    // The disk is still full for whichever connection the store has now
-    // (a new one, if that one was closed).
+    // The disk is still full for whichever connection the store has now.
+    // It is not inside a transaction: either sqlx saw that SQLite rolled
+    // the failed one back (0.9.1 on), or `reusable` closed the connection
+    // and the pool opened another.
     {
+        use sqlx::Connection;
         let mut conn = store.pool.acquire().await.unwrap();
+        assert!(
+            !conn.is_in_transaction(),
+            "the connection the failure was on came back inside a transaction"
+        );
         sqlx::query(sqlx::AssertSqlSafe(full))
             .execute(&mut *conn)
             .await

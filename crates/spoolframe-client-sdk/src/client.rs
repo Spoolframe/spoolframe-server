@@ -50,13 +50,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Mbit/s).
 ///
 /// Past a lost packet, or ahead of a reader that has fallen behind, QUIC
-/// holds what follows until it can be read. noq-proto 1.4.0, the release
-/// iroh builds on, keeps each full-size packet of it as its own buffer
-/// and closes the connection when it holds more than about 2,048 ("too
-/// many gaps in stream buffer"). 2 MiB stays under 1,900 packets of the
-/// smallest size QUIC allows, so the SDK works with 1.4.0. The fix is
-/// noq#866, not yet in a noq-proto release; the README tells how to
-/// patch an app's build with it.
+/// holds what follows until it can be read. noq-proto 1.4.0 kept each
+/// full-size packet of it as its own buffer and closed the connection
+/// when it held more than about 2,048 ("too many gaps in stream
+/// buffer"); 2 MiB stays under 1,900 packets of the smallest size QUIC
+/// allows. noq-proto 1.5.0 (noq#866), which iroh 1.5 requires, merges
+/// them, so the window is no longer held down by that limit.
 pub const STREAM_WINDOW: u32 = 2 << 20;
 
 type RevisionState = Arc<tokio::sync::Mutex<Option<u64>>>;

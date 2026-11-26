@@ -81,16 +81,6 @@ ignore = [
   # 0.12.1 is affected. The server never reuses a hasher after a panic.
   # Our own sha2 is 0.11, so the SDK graph is clear.
   { id = "GHSA-qwgh-2vcv-g2f7", reason = "block-buffer < 0.12.1 comes through digest 0.10 in openidconnect, oauth2, sqlx, soketto and webauthn-rs, all at their latest; no hasher is reused after a panic" },
-  # libsqlite3-sys 0.37 (bundled SQLite below 3.54.0): a crafted database
-  # opened with a mismatched `-wal` file can corrupt memory. It needs both
-  # files planted where our process opens them; our databases (the
-  # server's state, the SDK's offline.sqlite3) are private files of the
-  # server's state directory or the app's sandbox, written only by us.
-  # Not fixable yet: sqlx-sqlite 0.9.0 (its latest) takes libsqlite3-sys
-  # >= 0.30.1, < 0.38, and `links = "sqlite3"` allows one in the tree.
-  # Drop this once sqlx allows libsqlite3-sys >= 0.39; rusqlite then goes
-  # to 0.41.
-  { id = "RUSTSEC-2026-0459", reason = "SQLite < 3.54.0 needs a crafted database plus a mismatched -wal file opened by our process; our databases are private files; sqlx 0.9 pins libsqlite3-sys < 0.38" },
 ]
 
 # Several versions of one crate come from upstream (iroh, the HTTP and
@@ -99,11 +89,8 @@ ignore = [
 [bans]
 multiple-versions = "allow"
 
-# Every crate from crates.io, but for noq-proto, pinned to a commit of
-# noq's main until a release carries the stream-assembler fix (the root
-# Cargo.toml's [patch.crates-io], PX-62). Anything else from git, or from
-# another registry, is a mistake.
+# Every crate from crates.io. Anything from git, or from another
+# registry, is a mistake.
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/n0-computer/noq"]

@@ -12,8 +12,7 @@ devenv --no-tui tasks run --profile ci ci:static ci:style ci:test
 
 All inputs are public: Nix inputs from GitHub, pinned in `flake.lock` and
 `devenv.lock` (keep both on the same nixpkgs revision), and crates from
-crates.io, except noq-proto, which comes from noq's git until a release
-has noq#866 (the `[patch.crates-io]` in `Cargo.toml`).
+crates.io.
 
 | Task | Runs |
 |---|---|

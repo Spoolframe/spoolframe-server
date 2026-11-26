@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.6
+
+- Changed, server and SDK: iroh 1.5 (noq 1.5). Its QUIC state machine,
+  noq-proto 1.5.0, has the stream-assembler fix (noq#866) on crates.io,
+  so the workspace no longer takes noq-proto from git. Apps using the SDK
+  drop the `[patch.crates-io] noq-proto` line its README asked for.
+- Fixed, server and SDK: SQLite 3.54 (libsqlite3-sys 0.40, through sqlx
+  0.9.1 and rusqlite 0.43), which fixes RUSTSEC-2026-0459. The SDK now
+  needs rusqlite 0.42 or later; the advisory is no longer ignored.
+
 ## 0.17.5
 
 - Fixed, server: a Matroska file whose `DURATION` tag passes 24 hours

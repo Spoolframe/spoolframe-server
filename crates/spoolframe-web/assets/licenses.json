@@ -258,7 +258,7 @@
 "Apache-2.0": 6,
 "MIT": 1
 },
-"version": "1.0.104"
+"version": "1.0.105"
 },
 {
 "copyright": [
@@ -837,7 +837,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "1.12.1"
+"version": "1.12.2"
 },
 {
 "copyright": [
@@ -1013,7 +1013,7 @@
 "Apache-2.0": 29,
 "MIT": 8
 },
-"version": "4.6.7"
+"version": "4.6.10"
 },
 {
 "copyright": [
@@ -1030,7 +1030,7 @@
 "Apache-2.0": 29,
 "MIT": 8
 },
-"version": "4.6.7"
+"version": "4.6.10"
 },
 {
 "copyright": [
@@ -1047,7 +1047,7 @@
 "Apache-2.0": 29,
 "MIT": 8
 },
-"version": "1.1.1"
+"version": "1.1.2"
 },
 {
 "copyright": [
@@ -1208,7 +1208,7 @@
 "CC0-1.0": 23,
 "MIT-0": 32
 },
-"version": "0.6.1"
+"version": "0.6.2"
 },
 {
 "copyright": [
@@ -1383,7 +1383,7 @@
 "Apache-2.0": 7,
 "MIT": 35
 },
-"version": "1.5.5"
+"version": "1.5.6"
 },
 {
 "copyright": [
@@ -2455,7 +2455,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.2.29"
+"version": "0.2.30"
 },
 {
 "copyright": [
@@ -2566,7 +2566,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "1.2.2"
+"version": "1.2.3"
 },
 {
 "copyright": [
@@ -3042,7 +3042,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "0.4.0"
+"version": "0.4.1"
 },
 {
 "copyright": [
@@ -3089,7 +3089,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "0.4.20"
+"version": "0.4.21"
 },
 {
 "copyright": [
@@ -3153,7 +3153,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.17.1"
+"version": "0.17.2"
 },
 {
 "copyright": [],
@@ -3201,7 +3201,7 @@
 "Apache-2.0": 61,
 "MIT": 62
 },
-"version": "0.26.3"
+"version": "0.26.4"
 },
 {
 "copyright": [
@@ -3361,7 +3361,7 @@
 "texts": {
 "MIT": 67
 },
-"version": "1.12.0"
+"version": "1.13.0"
 },
 {
 "copyright": [
@@ -3750,7 +3750,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "1.4.1"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -3766,7 +3766,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "1.4.1"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -3782,7 +3782,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "1.4.1"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -3815,7 +3815,7 @@
 "Apache-2.0": 78,
 "MIT": 1
 },
-"version": "1.0.2"
+"version": "1.0.3"
 },
 {
 "copyright": [
@@ -3831,7 +3831,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "1.4.1"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -3912,7 +3912,7 @@
 "MIT": 26,
 "Unlicense": 27
 },
-"version": "1.0.1"
+"version": "1.0.3"
 },
 {
 "copyright": [
@@ -3928,7 +3928,7 @@
 "MIT": 26,
 "Unlicense": 27
 },
-"version": "1.0.1"
+"version": "1.0.2"
 },
 {
 "copyright": [
@@ -3960,7 +3960,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "0.26.1"
+"version": "0.26.2"
 },
 {
 "copyright": [
@@ -3976,7 +3976,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "0.26.1"
+"version": "0.26.2"
 },
 {
 "copyright": [
@@ -3992,7 +3992,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "0.26.1"
+"version": "0.26.2"
 },
 {
 "copyright": [
@@ -4007,7 +4007,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "0.26.1"
+"version": "0.26.2"
 },
 {
 "copyright": [
@@ -4023,7 +4023,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "0.26.1"
+"version": "0.26.2"
 },
 {
 "copyright": [
@@ -4038,7 +4038,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "0.26.1"
+"version": "0.26.2"
 },
 {
 "copyright": [
@@ -4053,7 +4053,7 @@
 "texts": {
 "MIT": 1
 },
-"version": "0.26.1"
+"version": "0.26.2"
 },
 {
 "copyright": [
@@ -4132,7 +4132,7 @@
 "Apache-2.0": 81,
 "MIT": 1
 },
-"version": "0.4.7"
+"version": "0.4.8"
 },
 {
 "copyright": [
@@ -4202,7 +4202,7 @@
 "texts": {
 "MIT": 82
 },
-"version": "0.37.0"
+"version": "0.40.0"
 },
 {
 "copyright": [
@@ -4316,6 +4316,21 @@
 "MIT": 84
 },
 "version": "0.18.5"
+},
+{
+"copyright": [
+"Copyright (c) 2016 Jerome Froelich"
+],
+"group": "crates",
+"license": "MIT",
+"name": "lru",
+"ships": [
+"server"
+],
+"texts": {
+"MIT": 84
+},
+"version": "0.19.2"
 },
 {
 "copyright": [
@@ -4691,7 +4706,7 @@
 "Apache-2.0": 102,
 "MIT": 1
 },
-"version": "0.1.0"
+"version": "0.1.1"
 },
 {
 "copyright": [
@@ -4777,6 +4792,21 @@
 },
 {
 "copyright": [
+"Copyright (c) 2021-2026 shellrow"
+],
+"group": "crates",
+"license": "MIT",
+"name": "netdev",
+"ships": [
+"server"
+],
+"texts": {
+"MIT": 104
+},
+"version": "0.47.0"
+},
+{
+"copyright": [
 "Copyright (c) Corentin Henry"
 ],
 "group": "crates",
@@ -4856,6 +4886,21 @@
 ],
 "group": "crates",
 "license": "MIT",
+"name": "netlink-proto",
+"ships": [
+"server"
+],
+"texts": {
+"MIT": 105
+},
+"version": "0.13.0"
+},
+{
+"copyright": [
+"Copyright (c) Corentin Henry"
+],
+"group": "crates",
+"license": "MIT",
 "name": "netlink-sys",
 "ships": [
 "server"
@@ -4895,6 +4940,22 @@
 "MIT": 1
 },
 "version": "0.19.3"
+},
+{
+"copyright": [
+"Copyright (c) n0 team"
+],
+"group": "crates",
+"license": "MIT OR Apache-2.0",
+"name": "netwatch",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 0,
+"MIT": 1
+},
+"version": "0.20.2"
 },
 {
 "copyright": [
@@ -4973,7 +5034,7 @@
 "Apache-2.0": 108,
 "MIT": 109
 },
-"version": "1.4.0"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -5011,7 +5072,7 @@
 "Apache-2.0": 108,
 "MIT": 109
 },
-"version": "1.4.0"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -5646,21 +5707,6 @@
 "texts": {
 "MIT": 114
 },
-"version": "3.0.6"
-},
-{
-"copyright": [
-"Copyright (c) 2016 Jonathan Creekmore"
-],
-"group": "crates",
-"license": "MIT",
-"name": "pem",
-"ships": [
-"server"
-],
-"texts": {
-"MIT": 114
-},
 "version": "4.0.0"
 },
 {
@@ -5741,7 +5787,7 @@
 "Apache-2.0": 50,
 "MIT": 1
 },
-"version": "1.1.13"
+"version": "1.2.0"
 },
 {
 "copyright": [],
@@ -5756,7 +5802,7 @@
 "Apache-2.0": 50,
 "MIT": 1
 },
-"version": "0.2.17"
+"version": "0.2.18"
 },
 {
 "copyright": [
@@ -5851,7 +5897,7 @@
 "texts": {
 "MIT": 115
 },
-"version": "1.10.3"
+"version": "1.10.4"
 },
 {
 "copyright": [
@@ -5945,7 +5991,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "1.1.3"
+"version": "1.2.0"
 },
 {
 "copyright": [
@@ -6170,7 +6216,7 @@
 "Apache-2.0": 122,
 "MIT": 1
 },
-"version": "0.10.3"
+"version": "0.10.4"
 },
 {
 "copyright": [
@@ -6322,7 +6368,7 @@
 "Apache-2.0": 123,
 "MIT": 1
 },
-"version": "0.10.2"
+"version": "0.10.3"
 },
 {
 "copyright": [
@@ -6404,7 +6450,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.4.18"
+"version": "0.4.19"
 },
 {
 "copyright": [
@@ -6421,7 +6467,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.8.11"
+"version": "0.8.12"
 },
 {
 "copyright": [],
@@ -6514,7 +6560,7 @@
 "texts": {
 "Apache-2.0": 0
 },
-"version": "3.10.0"
+"version": "3.11.0"
 },
 {
 "copyright": [
@@ -7228,7 +7274,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "3.24.0"
+"version": "3.25.0"
 },
 {
 "copyright": [
@@ -7335,7 +7381,7 @@
 "Apache-2.0": 4,
 "MIT": 1
 },
-"version": "0.11.1"
+"version": "0.11.2"
 },
 {
 "copyright": [
@@ -7445,7 +7491,7 @@
 "texts": {
 "MIT": 146
 },
-"version": "0.12.0"
+"version": "0.13.1"
 },
 {
 "copyright": [
@@ -7524,7 +7570,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "1.16.5"
+"version": "1.16.6"
 },
 {
 "copyright": [
@@ -7868,11 +7914,11 @@
 "Apache-2.0": 152,
 "MIT": 1
 },
-"version": "0.9.0"
+"version": "0.9.1"
 },
 {
 "copyright": [
-"Copyright (c) Ryan Leckey, Austin Bonander, Chloe Ross, Daniel Akhterov"
+"Copyright (C) SQLx Contributors"
 ],
 "group": "crates",
 "license": "MIT OR Apache-2.0",
@@ -7881,14 +7927,14 @@
 "server"
 ],
 "texts": {
-"Apache-2.0": 0,
+"Apache-2.0": 152,
 "MIT": 1
 },
-"version": "0.9.0"
+"version": "0.9.1"
 },
 {
 "copyright": [
-"Copyright (c) Ryan Leckey, Austin Bonander, Chloe Ross, Daniel Akhterov"
+"Copyright (C) SQLx Contributors"
 ],
 "group": "crates",
 "license": "MIT OR Apache-2.0",
@@ -7897,10 +7943,10 @@
 "server"
 ],
 "texts": {
-"Apache-2.0": 0,
+"Apache-2.0": 152,
 "MIT": 1
 },
-"version": "0.9.0"
+"version": "0.9.1"
 },
 {
 "copyright": [
@@ -8289,7 +8335,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.9.1"
+"version": "0.10.0"
 },
 {
 "copyright": [
@@ -8351,7 +8397,7 @@
 "Apache-2.0": 29,
 "MIT": 8
 },
-"version": "1.2.1+spec-1.1.0"
+"version": "1.2.3+spec-1.1.0"
 },
 {
 "copyright": [
@@ -8385,7 +8431,7 @@
 "Apache-2.0": 29,
 "MIT": 8
 },
-"version": "1.1.5+spec-1.1.0"
+"version": "1.1.7+spec-1.1.0"
 },
 {
 "copyright": [
@@ -8780,7 +8826,7 @@
 "texts": {
 "BSD-2-Clause": 169
 },
-"version": "0.10.1"
+"version": "0.10.2"
 },
 {
 "copyright": [
@@ -8796,7 +8842,7 @@
 "texts": {
 "MIT": 170
 },
-"version": "0.9.2"
+"version": "0.9.4"
 },
 {
 "copyright": [
@@ -8816,6 +8862,21 @@
 },
 {
 "copyright": [
+"Copyright (c) YesLogic Pty. Ltd."
+],
+"group": "crates",
+"license": "Apache-2.0",
+"name": "unicode-general-category",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 7
+},
+"version": "1.1.0"
+},
+{
+"copyright": [
 "Copyright © 1991-2023 Unicode, Inc."
 ],
 "group": "crates",
@@ -8831,6 +8892,24 @@
 "Unicode-3.0": 71
 },
 "version": "1.0.27"
+},
+{
+"copyright": [
+"Copyright (c) 2015 The Rust Project Developers",
+"Copyright © 1991-2023 Unicode, Inc."
+],
+"group": "crates",
+"license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+"name": "unicode-normalization",
+"ships": [
+"server"
+],
+"texts": {
+"Apache-2.0": 10,
+"MIT": 1,
+"Unicode-3.0": 71
+},
+"version": "0.1.26"
 },
 {
 "copyright": [
@@ -8894,7 +8973,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "2.5.8"
+"version": "2.5.9"
 },
 {
 "copyright": [
@@ -8961,7 +9040,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "1.29.2"
+"version": "1.29.3"
 },
 {
 "copyright": [
@@ -8977,7 +9056,7 @@
 "MIT": 26,
 "Unlicense": 27
 },
-"version": "2.5.0"
+"version": "2.5.1"
 },
 {
 "copyright": [
@@ -9253,7 +9332,7 @@
 "Apache-2.0": 4,
 "MIT": 1
 },
-"version": "0.3.0"
+"version": "0.3.1"
 },
 {
 "copyright": [
@@ -9365,7 +9444,7 @@
 "BSD-2-Clause": 179,
 "MIT": 1
 },
-"version": "0.8.63"
+"version": "0.8.65"
 },
 {
 "copyright": [
@@ -9397,7 +9476,7 @@
 "Apache-2.0": 28,
 "MIT": 1
 },
-"version": "1.9.1"
+"version": "1.9.2"
 },
 {
 "copyright": [
@@ -9444,7 +9523,7 @@
 "texts": {
 "MIT": 149
 },
-"version": "9.6.0"
+"version": "9.8.2"
 },
 {
 "copyright": [],
@@ -9457,7 +9536,7 @@
 "texts": {
 "Zlib": 180
 },
-"version": "0.6.8"
+"version": "0.6.9"
 },
 {
 "copyright": [
@@ -9488,7 +9567,7 @@
 "texts": {
 "BSD-3-Clause": 181
 },
-"version": "0.13.5"
+"version": "0.13.6"
 },
 {
 "copyright": [
@@ -9503,7 +9582,7 @@
 "texts": {
 "BSD-3-Clause": 181
 },
-"version": "7.4.1"
+"version": "7.4.2"
 },
 {
 "copyright": [
@@ -9521,7 +9600,7 @@
 "BSD-2-Clause": 182,
 "BSD-3-Clause": 181
 },
-"version": "2.1.3+zstd.1.5.7"
+"version": "2.2.0+zstd.1.6.0"
 },
 {
 "copyright": [

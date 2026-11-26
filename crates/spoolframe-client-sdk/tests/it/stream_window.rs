@@ -5,13 +5,12 @@
 //! packet of the body is lost on the way. QUIC must hold the whole window
 //! and hand it over once the lost packet comes again.
 //!
-//! The noq-proto release iroh builds on (1.4.0) kept each full-size
-//! packet past a gap, or ahead of an unread stretch, as its own buffer and
-//! closed the connection with `INTERNAL_ERROR` ("too many gaps in stream
-//! buffer") once it held more than 2,048 of them: any window above about
-//! 2.4 MiB failed this test, and the 8 MiB case fails against it still.
-//! noq#866, which the workspace takes from git (the root Cargo.toml's
-//! `[patch.crates-io]`), merges them, as quinn does.
+//! noq-proto 1.4.0 kept each full-size packet past a gap, or ahead of an
+//! unread stretch, as its own buffer and closed the connection with
+//! `INTERNAL_ERROR` ("too many gaps in stream buffer") once it held more
+//! than 2,048 of them: any window above about 2.4 MiB failed this test,
+//! and the 8 MiB case fails against it still. noq#866, released in
+//! noq-proto 1.5.0 (which iroh 1.5 requires), merges them, as quinn does.
 //!
 //! In-process a lost packet comes again within a millisecond, so the loss
 //! alone cannot pile a window's worth behind it as a 300 ms path did: the

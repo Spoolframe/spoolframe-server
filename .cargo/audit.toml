@@ -11,10 +11,6 @@ ignore = [
   # block-buffer < 0.12.1, through digest 0.10 on the server: no hasher is
   # reused after a panic.
   "GHSA-qwgh-2vcv-g2f7",
-  # libsqlite3-sys 0.37 (SQLite < 3.54.0): needs a crafted database and a
-  # mismatched -wal file opened by our process; our databases are private
-  # files. sqlx 0.9 pins libsqlite3-sys < 0.38: drop once it allows 0.39.
-  "RUSTSEC-2026-0459",
   # basic-toml: unmaintained; read only by askama's derive macro, at build
   # time, in the FFI crate's optional bindings generator.
   "RUSTSEC-2026-0374",

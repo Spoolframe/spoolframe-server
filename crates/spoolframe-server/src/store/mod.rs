@@ -250,11 +250,13 @@ async fn end_device(
 /// lock it took, open: every other connection's write then fails with
 /// "database is locked" until the server restarts (2026-10-08). Closing
 /// the connection ends whatever SQLite still has open on it; the pool
-/// opens a new one when it needs one. `closed` counts the ones closed.
-async fn reusable(
-    conn: &mut sqlx::SqliteConnection,
-    closed: &std::sync::atomic::AtomicU64,
-) -> Result<bool, sqlx::Error> {
+/// opens a new one when it needs one.
+///
+/// sqlx 0.9.1 asks SQLite whether a transaction is still open and stops
+/// counting one that is not, so this no longer meets the case itself.
+/// It stays as a guard: a connection inside a transaction must never go
+/// back to the pool, whoever lost count.
+async fn reusable(conn: &mut sqlx::SqliteConnection) -> Result<bool, sqlx::Error> {
     use sqlx::Connection;
     // Most connections come back outside any transaction, and sqlx's
     // count of them only goes down: it falls when the connection's
@@ -268,7 +270,6 @@ async fn reusable(
     conn.ping().await?;
     let reusable = !conn.is_in_transaction();
     if !reusable {
-        closed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             "a database connection came back to the pool still counted inside a \
              transaction; closing it"
@@ -286,10 +287,6 @@ pub struct Store {
     sessions_ended: std::sync::Arc<tokio::sync::watch::Sender<u64>>,
     /// What "now" is for the times it writes and compares (PX-09).
     clock: crate::clock::Clock,
-    /// Connections closed coming back to the pool inside a transaction
-    /// ([`reusable`]).
-    #[cfg_attr(not(test), allow(dead_code))]
-    closed_in_transaction: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Store {
@@ -346,16 +343,9 @@ impl Store {
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
-        let closed_in_transaction = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
-            .after_release({
-                let closed = closed_in_transaction.clone();
-                move |conn, _| {
-                    let closed = closed.clone();
-                    Box::pin(async move { reusable(conn, &closed).await })
-                }
-            })
+            .after_release(|conn, _| Box::pin(async move { reusable(conn).await }))
             .connect_with(options)
             .await
             .map_err(|source| StoreError::Open {
@@ -372,7 +362,6 @@ impl Store {
             pool,
             sessions_ended: std::sync::Arc::new(tokio::sync::watch::Sender::new(0)),
             clock: crate::clock::Clock::default(),
-            closed_in_transaction,
         })
     }
 

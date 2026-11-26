@@ -74,7 +74,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "ti
 # library builds with cmake (devenv.nix, nix/package.nix). Iroh picks its
 # provider from its own features, so it never falls back to ring while
 # nothing turns on `tls-ring`.
-iroh = { version = "1.4", default-features = false, features = ["tls-aws-lc-rs"] }
+iroh = { version = "1.5", default-features = false, features = ["tls-aws-lc-rs"] }
 # The process's TLS provider, installed by the binaries that also link
 # reqwest 0.12 (see `reqwest` below): aws-lc-rs, the same as iroh's.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
@@ -148,7 +148,7 @@ jsonrpsee = { version = "0.26", default-features = false }
 # RUSTSEC-2026-0457, -0461 and -0462. The macros are not used (the tools
 # are listed by hand, each with its scope). Not `auth`: the server is its
 # own authorization server (crate::oauth).
-rmcp = { version = "3.10", default-features = false, features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-streamable-http-server"] }
 # Admin CLI password prompts.
 rpassword = "7"
 # Tower services: the admin listener mounts jsonrpsee as one.
@@ -331,18 +331,3 @@ codegen-units = 1
 strip = "debuginfo"
 debug = false
 opt-level = "z"
-
-# iroh's QUIC state machine from noq's main, at the merge of noq#866
-# (PX-62): crates.io's latest, 1.4.0, closes a connection past a lost
-# packet or ahead of a slow reader once a stream holds more than 2,048
-# packets ("too many gaps in stream buffer"); #866 merges contiguous
-# chunks so it no longer does. Unreleased, so a git pin: main is 1.5.0,
-# which iroh's `^1.4.0` accepts, and brings #867 (unordered streams keep
-# unread data when compacted), `send_fairness` deprecated (#835) and
-# `SendStream::set_affinity` (#836) with it. This reaches only this
-# workspace (crates.io ignores a published crate's `[patch]`): the SDK's
-# users carry the same line, or build against the unfixed release
-# (crates/spoolframe-client-sdk/README.md). Drop it for the first
-# noq-proto release that has #866.
-[patch.crates-io]
-noq-proto = { git = "https://github.com/n0-computer/noq", rev = "3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a" }

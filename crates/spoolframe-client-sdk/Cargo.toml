@@ -60,14 +60,11 @@ tracing = { workspace = true }
 # (downloads/local_db.rs); bundled, so every platform has FTS5.
 #
 # A range, not one version. libsqlite3-sys `links = "sqlite3"`, so a tree
-# has one copy. The server's sqlx (sqlx-sqlite 0.9) caps it below 0.38, so
-# this workspace resolves rusqlite 0.39 / libsqlite3-sys 0.37 and ignores
-# RUSTSEC-2026-0459 for it (deny.toml, audit.toml). An app, which has no
-# sqlx, resolves the newest in range: rusqlite 0.43 / libsqlite3-sys 0.40,
-# which has the fix. The SDK uses only the API both ends share, and CI
-# tests it against the newest (scripts/sdk-newest-sqlite.sh). Raise the
-# floor once sqlx lifts its cap.
-rusqlite = { version = ">=0.39, <0.44", features = ["bundled"] }
+# has one copy, and an app that also builds sqlx or another rusqlite user
+# needs room to agree with it. The floor is rusqlite 0.42, the first on
+# libsqlite3-sys 0.40 (SQLite 3.54), which fixes RUSTSEC-2026-0459; the
+# server's sqlx 0.9.1 allows it, so this workspace builds the newest too.
+rusqlite = { version = ">=0.42, <0.44", features = ["bundled"] }
 # Folds accents for search with no server (`Client::search_offline`).
 unicode-normalization = "0.1.25"
 uniffi = { workspace = true, optional = true }
