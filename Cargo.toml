@@ -27,8 +27,7 @@ snmalloc-rs = { version = "0.7.5", default-features = false, features = ["build_
 tmpdir = "1"
 # Locks that do not poison (PX-10): a panic while one is held, say from a
 # parser bug a fuzzer found, must not make every later lock panic too.
-# Already in the build through iroh and tokio.
-parking_lot = "0.12.5"
+parking_lot = "0.13"
 # A body shared by every upload of the uplink measurement, sliced.
 # Already in the build through reqwest and iroh.
 bytes = "1.12"
@@ -86,7 +85,7 @@ iroh-mdns-address-lookup = "0.6"
 # directly, by the server only: that feature would make every iroh
 # endpoint in a workspace build map its port, the SDK's and the tests'
 # included. No metrics, as iroh's are off.
-portmapper = { version = "0.19.3", default-features = false }
+portmapper = { version = "0.20", default-features = false }
 
 # The server database: SQLite through sqlx, with its migrator. Runtime
 # queries only; `macros` is for `migrate!`, which embeds the migrations.
@@ -130,7 +129,7 @@ webauthn-rs-proto = "0.6.2"
 # Already in the build through webauthn-rs.
 uuid = { version = "1.27", default-features = false, features = ["std", "v7"] }
 # Credential ids, as base64url text.
-base64 = "0.22"
+base64 = "0.23"
 # SSO (P3-04): the OpenID Connect client, which checks ID tokens itself
 # (issuer, audience, expiry, nonce, signature from the provider's keys).
 # Its own reqwest feature, on the reqwest 0.12 the server already has.
@@ -217,7 +216,7 @@ earshot = "1.2"
 # A downloaded subtitle made UTF-8 (PX-02): many are CP-1251, CP-1252 and
 # the like. chardetng guesses the encoding of a file with no BOM that is
 # not UTF-8; encoding_rs (already in the tree) decodes it. Pure Rust.
-chardetng = "0.1"
+chardetng = "1.0"
 encoding_rs = "0.8"
 # SubDL's subtitles come zipped (PX-02): read only, deflate by the
 # flate2 and zlib-rs the tree already has; no other method, no encryption.
@@ -280,8 +279,8 @@ uniffi = { version = "0.32.2", default-features = false }
 uniffi_bindgen = { version = "0.32.2", default-features = false }
 # This device's addresses, for the FFI's at_home_here and
 # default_quality_here on Apple and Linux (getifaddrs): the version iroh's
-# netwatch already builds, so no second copy (0.47 is out).
-netdev = "0.46"
+# netwatch already builds, so no second copy (0.48 is out).
+netdev = "0.47"
 # The FFI's `android` feature: the app's Context, through JNI, for
 # ndk-context. The versions netdev already builds (jni 0.22 is out, and
 # the DNS resolver's; netdev's 0.21 is the one whose Context this sets).

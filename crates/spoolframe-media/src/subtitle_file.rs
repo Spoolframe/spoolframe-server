@@ -308,9 +308,11 @@ fn decode(bytes: &[u8]) -> (String, &'static encoding_rs::Encoding) {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return (text.to_owned(), encoding_rs::UTF_8);
     }
-    let mut detector = chardetng::EncodingDetector::new();
+    // ISO-2022-JP allowed, as chardetng before 1.0 always did: a subtitle
+    // runs no script, so the reason browsers leave it out does not apply.
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
-    let encoding = detector.guess(None, true);
+    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
     let (text, _) = encoding.decode_without_bom_handling(bytes);
     (text.into_owned(), encoding)
 }

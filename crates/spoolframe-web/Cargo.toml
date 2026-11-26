@@ -18,7 +18,7 @@ serde_json = { workspace = true }
 spoolframe-admin-api = { workspace = true, features = ["client"] }
 # The invite's QR code (P6-01), drawn as an SVG path; the encoder only,
 # as the Linux app takes it.
-qrcode = { version = "0.14", default-features = false }
+qrcode = { version = "0.15", default-features = false }
 
 # `required::option`, for the `/auth` answers' required `Option` fields;
 # its calendar dates, for the pages' dates (host-tested too).
