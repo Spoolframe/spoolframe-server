@@ -11,9 +11,9 @@ link it: the SDK does not depend on any GPL or AGPL crate.
 
 ```toml
 [dependencies]
-spoolframe-client-sdk = "0.17"
+spoolframe-client-sdk = "0.18"
 # With the GStreamer-friendly media readers:
-# spoolframe-client-sdk = { version = "0.17", features = ["media-readers"] }
+# spoolframe-client-sdk = { version = "0.18", features = ["media-readers"] }
 ```
 
 The wire protocol is stable: an app and a server of different releases
@@ -42,14 +42,14 @@ Coldsteel copy, at the same exact version:
 
 ```toml
 [dependencies]
-spoolframe-client-sdk = "=0.17.5"
+spoolframe-client-sdk = "=0.18.0"
 
 [patch.crates-io]
-spoolframe-types = { version = "=0.17.5", registry = "coldsteel" }
-spoolframe-protocol = { version = "=0.17.5", registry = "coldsteel" }
-spoolframe-policy = { version = "=0.17.5", registry = "coldsteel" }
-spoolframe-client-sdk = { version = "=0.17.5", registry = "coldsteel" }
-spoolframe-hls-bridge = { version = "=0.17.5", registry = "coldsteel" }
+spoolframe-types = { version = "=0.18.0", registry = "coldsteel" }
+spoolframe-protocol = { version = "=0.18.0", registry = "coldsteel" }
+spoolframe-policy = { version = "=0.18.0", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "=0.18.0", registry = "coldsteel" }
+spoolframe-hls-bridge = { version = "=0.18.0", registry = "coldsteel" }
 ```
 
 The Coldsteel copies depend on each other as crates.io crates, and a
@@ -70,11 +70,11 @@ registry on the dependency:
 
 ```toml
 [dependencies]
-spoolframe-client-sdk = { version = "=0.17.5-gab12d3b", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "=0.18.0-gab12d3b", registry = "coldsteel" }
 ```
 
-Always use `=`. `"0.17"` does not match a PR build, but
-`"0.17.0-beta.1"` does: it matches every later pre-release of 0.17.0, so
+Always use `=`. `"0.18"` does not match a PR build, but
+`"0.18.0-beta.1"` does: it matches every later pre-release of 0.18.0, so
 it can select a build from any PR.
 These builds are for tests only: they are never on crates.io.
 

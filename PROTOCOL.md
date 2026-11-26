@@ -725,7 +725,7 @@ One bidirectional stream, each frame a client-protocol frame of at most
   k}` (`reason` at most 200 characters). `k` says what kind of failure,
   for the phone to act on: `rate_limited` (too many sign-ins at once or
   waiting there), `recent_sign_in_required`, `session_ended` (the
-  phone's session there has ended; since 0.17.6), `not_allowed` (a
+  phone's session there has ended; since 0.18.0), `not_allowed` (a
   guest, or a role), `feature_off`, `unreachable`, `expired` (the grant ran out
   before the TV redeemed it) or `refused` (`reason` is the server's
   words). A TV before `kind` leaves it out, and a kind a phone does not
@@ -834,7 +834,7 @@ Phone side:
   one that has said it lacks the feature lists none. A guest's profile
   (a portable identity's own, kept under its id) is never listed.
   `session()`, `session_ended()`, `username()` and
-  `display_name()` read either kind. Before 0.17.6 the choice was
+  `display_name()` read either kind. Before 0.18.0 the choice was
   `{ session, server }` and a server whose session had ended was left
   out.
 - `SignInOffer::offer(&choice, remember)` makes one sign-in

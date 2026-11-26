@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.17.6
+## 0.18.0
 
 - Changed, server and SDK: iroh 1.5 (noq 1.5). Its QUIC state machine,
   noq-proto 1.5.0, has the stream-assembler fix (noq#866) on crates.io,
@@ -33,7 +33,7 @@
   profile `portable` and `portable_fingerprint` (as `PortableProfile`
   has them), for `sign_in_portable` with no password asked.
 
-## 0.17.5
+## 0.17.5 (2026-11-19)
 
 - Fixed, server: a Matroska file whose `DURATION` tag passes 24 hours
   could not be read at all. The probe parsed the tag as a time of day.
