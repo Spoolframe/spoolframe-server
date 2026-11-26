@@ -9,6 +9,7 @@
 - Fixed, server and SDK: SQLite 3.54 (libsqlite3-sys 0.40, through sqlx
   0.9.1 and rusqlite 0.43), which fixes RUSTSEC-2026-0459. The SDK now
   needs rusqlite 0.42 or later; the advisory is no longer ignored.
+- Changed, SDK: bip39 3. Recovery phrases work the same as before.
 
 ## 0.17.5
 

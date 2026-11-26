@@ -111,7 +111,7 @@ ed25519-dalek = "3"
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 # The recovery phrase: BIP-39, its English wordlist and checksum (CC0).
 # `zeroize` clears a parsed phrase when dropped.
-bip39 = { version = "2", default-features = false, features = ["std", "zeroize"] }
+bip39 = { version = "3", default-features = false, features = ["std", "zeroize"] }
 # The root's entropy, from the OS. Already in the build through iroh.
 getrandom = "0.4"
 # Clears the phrase's words and the seed once used.

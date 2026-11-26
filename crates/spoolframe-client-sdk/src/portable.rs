@@ -129,8 +129,13 @@ impl PortableRoot {
     pub fn generate() -> (PortableRoot, RecoveryPhrase) {
         let mut entropy = Zeroizing::new([0u8; ENTROPY_LEN]);
         getrandom::fill(entropy.as_mut()).expect("the OS gives random bytes");
-        let mnemonic =
-            Mnemonic::from_entropy_in(Language::English, entropy.as_ref()).expect("32 bytes");
+        Self::from_entropy(&entropy)
+    }
+
+    /// The root and phrase `entropy` gives: BIP-39's words for it, and
+    /// the root those words recover.
+    fn from_entropy(entropy: &[u8; ENTROPY_LEN]) -> (PortableRoot, RecoveryPhrase) {
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy).expect("32 bytes");
         let root = Self::from_mnemonic(&mnemonic);
         (root, RecoveryPhrase(mnemonic))
     }
@@ -1458,6 +1463,19 @@ mod tests {
     /// secret, `openssl pkey -pubout` for the Ed25519 public key.
     const ZERO_PHRASE_ID: &str = "610b431103deb4f932b5a063abf7d0f5d3fdcb63a6ae542283d6d4e0fd737111";
 
+    /// BIP-39's own test vector for 256 bits of 0x7f (the reference
+    /// implementation's vectors.json): every word but the last repeats,
+    /// and the last carries a checksum that is not all zeros, unlike
+    /// [`zero_phrase`]'s.
+    const SEVENS_PHRASE: &str = "legal winner thank year wave sausage worth useful legal winner \
+        thank year wave sausage worth useful legal winner thank year wave sausage worth title";
+
+    /// The id [`SEVENS_PHRASE`] gives, computed apart from this code as
+    /// [`ZERO_PHRASE_ID`] was. Old phrases must keep restoring the same
+    /// identity whatever BIP-39 crate parses them.
+    const SEVENS_PHRASE_ID: &str =
+        "aa847f50e555dab3d05ac9a14aa2ee88034ddf1f1b738b22ad6ab9b01942cddb";
+
     fn portable() -> (Arc<MemoryStorage>, Portable) {
         let storage = Arc::new(MemoryStorage::default());
         (storage.clone(), Portable::new(storage))
@@ -1483,6 +1501,22 @@ mod tests {
     fn the_test_vector_holds() {
         let root = PortableRoot::recover(&zero_phrase()).unwrap();
         assert_eq!(root.id().to_string(), ZERO_PHRASE_ID);
+    }
+
+    #[test]
+    fn a_phrase_with_a_checksum_keeps_its_identity() {
+        let root = PortableRoot::recover(SEVENS_PHRASE).unwrap();
+        assert_eq!(root.id().to_string(), SEVENS_PHRASE_ID);
+    }
+
+    /// New phrases are BIP-39's words for their entropy, so a phrase
+    /// written down today is one any later version reads.
+    #[test]
+    fn entropy_becomes_bip39_s_words() {
+        let (root, phrase) = PortableRoot::from_entropy(&[0x7f; ENTROPY_LEN]);
+        assert_eq!(phrase.to_string(), SEVENS_PHRASE);
+        assert_eq!(phrase.words().join(" "), SEVENS_PHRASE);
+        assert_eq!(root.id().to_string(), SEVENS_PHRASE_ID);
     }
 
     #[test]
