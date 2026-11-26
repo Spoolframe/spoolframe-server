@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::client::{ClientOptions, Device};
-use crate::storage::MemoryStorage;
+use crate::storage::{MemoryStorage, Storage};
 
 /// No test takes this long unless something hangs.
 const HANG: Duration = Duration::from_secs(60);
@@ -25,6 +25,10 @@ async fn within<T>(test: impl Future<Output = T>) -> T {
 }
 
 async fn open(name: &str, platform: Platform) -> Client {
+    open_on(Arc::new(MemoryStorage::default()), name, platform).await
+}
+
+async fn open_on(storage: Arc<MemoryStorage>, name: &str, platform: Platform) -> Client {
     let device = Device {
         name: name.into(),
         client_name: format!("sdk-{name}"),
@@ -37,7 +41,7 @@ async fn open(name: &str, platform: Platform) -> Client {
         relays: false,
         ..ClientOptions::default()
     };
-    Client::open_with_options(Arc::new(MemoryStorage::default()), device, options)
+    Client::open_with_options(storage, device, options)
         .await
         .unwrap()
 }
@@ -339,5 +343,225 @@ fn a_tv_s_failure_crosses_the_wire_whole() {
     assert_eq!(
         SignInFailure::from_wire(FailureKind::Unknown, "old words".into()),
         SignInFailure::Refused("old words".into())
+    );
+}
+
+/// A server saved on `storage`, verified, with its server id pinned:
+/// one [`SignInOffer::servers`] lists.
+async fn save_server(storage: &MemoryStorage, n: u8) -> EndpointId {
+    let endpoint = iroh::SecretKey::from_bytes(&[n; 32]).public();
+    let mut saved = crate::servers::load(storage).await.unwrap();
+    saved.push(crate::servers::SavedServer::pinned_now(
+        format!("Server {n}"),
+        endpoint.to_string(),
+        format!("server-{n}"),
+        vec!["127.0.0.1:9".parse().unwrap()],
+        true,
+    ));
+    crate::servers::save(storage, &saved).await.unwrap();
+    endpoint
+}
+
+/// A profile kept for `username` whose session the server ended.
+fn ended(username: &str) -> crate::session::StoredSession {
+    crate::session::StoredSession {
+        token: None,
+        username: username.into(),
+        display_name: username.to_uppercase(),
+        method: Some(crate::session::SignInMethod::Password),
+        portable: None,
+        admin: false,
+    }
+}
+
+/// One server's kept profiles that cannot be read lose that server's
+/// choices only: the other server's are still listed, and the list is
+/// not an error.
+#[tokio::test]
+async fn one_unreadable_server_leaves_the_others_listed() {
+    within(async {
+        let tv = tv().await;
+        let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+        let storage = Arc::new(MemoryStorage::default());
+        let broken = save_server(&storage, 1).await;
+        let fine = save_server(&storage, 2).await;
+        storage
+            .set_secret(
+                &crate::storage::keys::sessions(&broken.to_string()),
+                Some(b"not a list of sessions".to_vec()),
+            )
+            .await
+            .unwrap();
+        crate::session::save(storage.as_ref(), &fine, &[ended("alice")])
+            .await
+            .unwrap();
+        let phone = open_on(storage, "phone", Platform::Ios).await;
+        let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
+        let choices = offer.servers().await.unwrap();
+        assert_eq!(choices.len(), 1, "{choices:?}");
+        assert_eq!(choices[0].server.endpoint_id, fine.to_string());
+        assert!(choices[0].session_ended());
+        assert_eq!(choices[0].username(), "alice");
+        offer.decline().await.unwrap();
+    })
+    .await;
+}
+
+fn card() -> PairedServer {
+    PairedServer {
+        endpoint_id: "e".into(),
+        server_id: "s".into(),
+        name: "Home".into(),
+        addrs: Vec::new(),
+        relays: Vec::new(),
+    }
+}
+
+/// A live session for `username` on a server, as `Client::profiles`
+/// gives one, held by `client`.
+fn live(client: &Client, username: &str) -> Session {
+    Session {
+        client: client.clone(),
+        server: iroh::SecretKey::from_bytes(&[5; 32]).public(),
+        token: spoolframe_protocol::SessionId(format!("token-{username}")),
+        user: spoolframe_protocol::UserSummary {
+            user_id: format!("local:{username}"),
+            username: username.into(),
+            display_name: username.to_uppercase(),
+            role: spoolframe_types::Role::Consumer,
+            locked: false,
+            pin: None,
+            portable: Vec::new(),
+        },
+        can_leave: true,
+        remembered: None,
+        password_change_required: Arc::default(),
+    }
+}
+
+/// A profile kept with the session [`live`] makes for `username`.
+fn kept(username: &str) -> crate::session::StoredSession {
+    crate::session::StoredSession {
+        token: Some(format!("token-{username}")),
+        ..ended(username)
+    }
+}
+
+fn listed(choices: &[SignInChoice]) -> Vec<(String, bool)> {
+    choices
+        .iter()
+        .map(|c| (c.username().to_owned(), c.session_ended()))
+        .collect()
+}
+
+/// A profile answered for live whose token the later read finds gone
+/// (the server signed the phone out while another server was still
+/// asked) is one choice, `SessionEnded`: not a live one that no longer
+/// works, and not both.
+#[tokio::test]
+async fn a_session_that_ended_after_answering_is_listed_ended() {
+    let phone = phone().await;
+    let stored = [ended("alice"), ended("bob"), kept("carol")];
+    let choices = server_choices(
+        &card(),
+        vec![live(&phone, "alice"), live(&phone, "carol")],
+        &stored,
+        PhoneSignInSupport::On,
+    );
+    assert_eq!(
+        listed(&choices),
+        [
+            ("carol".to_owned(), false),
+            ("alice".to_owned(), true),
+            ("bob".to_owned(), true)
+        ]
+    );
+}
+
+/// A session the server answered for but that this device no longer
+/// keeps, forgotten here (`forget_profile`) or replaced by another
+/// sign-in as that user, is not listed live: its profile is gone, or
+/// another session now stands for it.
+#[tokio::test]
+async fn a_session_forgotten_or_replaced_after_answering_is_not_listed() {
+    let phone = phone().await;
+    let replaced = crate::session::StoredSession {
+        token: Some("a-newer-token".into()),
+        ..ended("bob")
+    };
+    let choices = server_choices(
+        &card(),
+        vec![
+            live(&phone, "alice"),
+            live(&phone, "bob"),
+            live(&phone, "carol"),
+        ],
+        &[replaced, kept("carol")],
+        PhoneSignInSupport::On,
+    );
+    assert_eq!(listed(&choices), [("carol".to_owned(), false)]);
+}
+
+/// A server this phone has heard say it takes no phone sign-ins lists
+/// nobody, ended profiles included: signing in again there could never
+/// sign the TV in. One not heard from still lists its ended profiles.
+#[tokio::test]
+async fn a_server_without_phone_sign_in_lists_no_ended_profile() {
+    let phone = phone().await;
+    let stored = [ended("bob")];
+    let off = server_choices(
+        &card(),
+        vec![live(&phone, "alice")],
+        &stored,
+        PhoneSignInSupport::Off,
+    );
+    assert!(off.is_empty(), "{off:?}");
+    let unknown = server_choices(&card(), Vec::new(), &stored, PhoneSignInSupport::Unknown);
+    assert_eq!(listed(&unknown), [("bob".to_owned(), true)]);
+}
+
+/// A guest's ended profile, kept under its identity's id, is not listed
+/// as "Sign in again", as its live session is not; a local account tied
+/// to an identity, which keeps its own username, is.
+#[test]
+fn a_guest_s_ended_profile_is_not_listed() {
+    let id: spoolframe_protocol::portable::PortableUserId =
+        "610b431103deb4f932b5a063abf7d0f5d3fdcb63a6ae542283d6d4e0fd737111"
+            .parse()
+            .unwrap();
+    let guest = crate::session::StoredSession {
+        username: id.to_string(),
+        portable: Some(id),
+        method: Some(crate::session::SignInMethod::Portable),
+        ..ended("guest")
+    };
+    let tied = crate::session::StoredSession {
+        portable: Some(id),
+        method: Some(crate::session::SignInMethod::Portable),
+        ..ended("carol")
+    };
+    let choices = server_choices(&card(), Vec::new(), &[guest, tied], PhoneSignInSupport::On);
+    assert_eq!(listed(&choices), [("carol".to_owned(), true)]);
+}
+
+/// The TV reads its own redemptions with [`SignInFailure::of`]: a TV
+/// told to sign in is not the phone's session ending, so it stays a
+/// refusal there. Only the phone's offer says `SessionEnded`. The race
+/// that gives the TV `SignInRequired` (a token revoked between its
+/// redemption and its `WhoAmI`) is not one a test can time, so the two
+/// classifiers are checked directly.
+#[test]
+fn only_the_phone_s_offer_reads_sign_in_required_as_session_ended() {
+    assert!(matches!(
+        SignInFailure::of(&SdkError::SignInRequired),
+        SignInFailure::Refused(_)
+    ));
+    assert_eq!(
+        SignInFailure::of_offer(&SdkError::SignInRequired),
+        SignInFailure::SessionEnded
+    );
+    assert_eq!(
+        SignInFailure::of_offer(&SdkError::RecentSignInRequired),
+        SignInFailure::RecentSignInRequired
     );
 }

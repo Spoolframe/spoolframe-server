@@ -95,13 +95,49 @@ pub struct PortableProfile {
     pub identity_fingerprint: String,
 }
 
-/// A profile kept on this device for a server, however it signs in.
-#[derive(Debug, Clone, uniffi::Record)]
+/// A profile kept on this device for a server, however it signs in:
+/// read from what the device keeps, so it works offline.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SavedProfileName {
     pub username: String,
     pub display_name: String,
     /// The server's admin, as the server last said.
     pub admin: bool,
+    /// The server ended this profile's session (it expired, was revoked,
+    /// or an admin reset the password): choosing it signs in again, the
+    /// way `method` says. False while a session is kept, which the server
+    /// may still have ended since; `SpoolClient.profiles` asks it.
+    pub session_ended: bool,
+    /// How their last sign-in on this device was made, so signing in
+    /// again offers the same. None when none is recorded.
+    pub method: Option<sdk::SignInMethod>,
+    /// With `method` `Portable`: the identity to sign in again with
+    /// (`sign_in_portable`, no password asked), hex, as
+    /// `PortableProfile.identity`.
+    pub portable: Option<String>,
+    /// That identity's fingerprint, as `PortableProfile.identity_fingerprint`.
+    pub portable_fingerprint: Option<String>,
+}
+
+/// A portable identity as the FFI gives it: its id (hex), and its
+/// fingerprint.
+fn identity_strings(id: sdk::PortableUserId) -> (String, String) {
+    (id.to_string(), id.fingerprint())
+}
+
+impl From<sdk::SavedProfile> for SavedProfileName {
+    fn from(p: sdk::SavedProfile) -> Self {
+        let (portable, portable_fingerprint) = p.portable.map(identity_strings).unzip();
+        Self {
+            session_ended: p.sign_in == sdk::ProfileSignIn::Password,
+            method: p.method,
+            portable,
+            portable_fingerprint,
+            username: p.username,
+            display_name: p.display_name,
+            admin: p.admin,
+        }
+    }
 }
 
 /// This device. One per app.
@@ -526,32 +562,29 @@ impl SpoolClient {
             .into_iter()
             .filter(|p| p.method == Some(sdk::SignInMethod::Portable))
             .filter_map(|p| {
-                p.portable.map(|id| PortableProfile {
-                    username: p.username,
-                    display_name: p.display_name,
-                    identity: id.to_string(),
-                    identity_fingerprint: id.fingerprint(),
+                p.portable.map(|id| {
+                    let (identity, identity_fingerprint) = identity_strings(id);
+                    PortableProfile {
+                        username: p.username,
+                        display_name: p.display_name,
+                        identity,
+                        identity_fingerprint,
+                    }
                 })
             })
             .collect())
     }
 
     /// Every profile kept on this device for `endpoint_id`: who else a
-    /// Leave leaves the server here for.
+    /// Leave leaves the server here for, and, offline, whose session has
+    /// ended and how each signs in again.
     pub async fn saved_profiles(
         &self,
         endpoint_id: String,
     ) -> Result<Vec<SavedProfileName>, SpoolError> {
         let client = self.client.clone();
         let saved = run(async move { client.saved_profiles(&endpoint_id).await }).await?;
-        Ok(saved
-            .into_iter()
-            .map(|p| SavedProfileName {
-                username: p.username,
-                display_name: p.display_name,
-                admin: p.admin,
-            })
-            .collect())
+        Ok(saved.into_iter().map(SavedProfileName::from).collect())
     }
 
     /// What an invite link says, sending nothing: the server, its
@@ -964,5 +997,56 @@ mod tests {
             ],
             [Some(sdk::CacheConfig { capacity: 500 }), None]
         );
+    }
+
+    fn saved(sign_in: sdk::ProfileSignIn, method: sdk::SignInMethod) -> sdk::SavedProfile {
+        sdk::SavedProfile {
+            username: "alice".into(),
+            display_name: "Alice".into(),
+            sign_in,
+            method: Some(method),
+            portable: None,
+            admin: false,
+        }
+    }
+
+    /// sf-android's "Sign in to Nimble again", offline: a profile whose
+    /// session the server ended says so, and how it signed in last.
+    #[test]
+    fn a_profile_whose_session_ended_says_so_with_its_method() {
+        let name = SavedProfileName::from(saved(
+            sdk::ProfileSignIn::Password,
+            sdk::SignInMethod::Passkey,
+        ));
+        assert!(name.session_ended);
+        assert_eq!(name.method, Some(sdk::SignInMethod::Passkey));
+        assert_eq!(name.portable, None);
+        assert_eq!(name.portable_fingerprint, None);
+    }
+
+    #[test]
+    fn a_profile_with_a_session_kept_has_not_ended() {
+        let name = SavedProfileName::from(saved(
+            sdk::ProfileSignIn::Automatic,
+            sdk::SignInMethod::Password,
+        ));
+        assert!(!name.session_ended);
+        assert_eq!(name.method, Some(sdk::SignInMethod::Password));
+    }
+
+    /// A portable profile carries its identity as `PortableProfile`
+    /// does, for `sign_in_portable` with no password sheet.
+    #[test]
+    fn a_portable_profile_carries_its_identity() {
+        let id: spoolframe_protocol::portable::PortableUserId =
+            "610b431103deb4f932b5a063abf7d0f5d3fdcb63a6ae542283d6d4e0fd737111"
+                .parse()
+                .unwrap();
+        let mut profile = saved(sdk::ProfileSignIn::Password, sdk::SignInMethod::Portable);
+        profile.portable = Some(id);
+        let name = SavedProfileName::from(profile);
+        assert!(name.session_ended);
+        assert_eq!(name.portable, Some(id.to_string()));
+        assert_eq!(name.portable_fingerprint, Some(id.fingerprint()));
     }
 }

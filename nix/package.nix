@@ -64,10 +64,7 @@
     buildInputs = [libucl];
   };
 
-  # Build dependencies separately for caching. noq-proto comes from git
-  # (the root Cargo.toml's [patch.crates-io], PX-62): crane vendors it
-  # with builtins.fetchGit at the rev Cargo.lock pins, so it needs no
-  # hash here.
+  # Build dependencies separately for caching.
   # Only the server's, with the features the build below uses, so the
   # cache matches it. The whole workspace's would check the FFI crate's
   # dev-dependency uniffi_bindgen, whose askama templates are read by

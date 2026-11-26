@@ -2084,6 +2084,16 @@ impl Client {
         self.link(id).info()
     }
 
+    /// Whether server `id` said it has `feature`, in its latest Hello;
+    /// `None` before this device heard from it.
+    pub(crate) fn server_has_feature(
+        &self,
+        id: EndpointId,
+        feature: spoolframe_protocol::Feature,
+    ) -> Option<bool> {
+        self.link(id).has_feature(feature)
+    }
+
     /// One request to `server` in `session`, within its time limit
     /// ([`Timeouts`]); see [`Client::on_connection`] for a connection
     /// that fails under it.

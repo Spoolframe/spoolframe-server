@@ -140,8 +140,8 @@ pub use pairing::{Connected, Paired, Pairing, PairingError, PairingOffer};
 // Signing a TV in with a phone, by the same QR code.
 pub use held::{HeldOffer, HeldPairing, HeldPhoneSignIn, HeldSignIn, HoldEnd};
 pub use phone_sign_in::{
-    PhoneConnected, PhoneSignIn, SignInChoice, SignInFailure, SignInOffer, SignInOfferOutcome,
-    SignInOfferResult,
+    ChoiceProfile, PhoneConnected, PhoneSignIn, SignInChoice, SignInFailure, SignInOffer,
+    SignInOfferOutcome, SignInOfferResult,
 };
 pub use spoolframe_protocol::invite::InviteLinkKind;
 pub use spoolframe_protocol::pairing::PairedServer;

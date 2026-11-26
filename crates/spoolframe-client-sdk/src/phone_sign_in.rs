@@ -47,7 +47,7 @@ use crate::pairing::{
 use crate::portable_sign_in::vouched_for;
 use crate::server_sign_ins::{ServerSignIn, ServerSignIns, Tally, sign_in_each};
 use crate::servers;
-use crate::session::Session;
+use crate::session::{self, SavedProfile, Session, StoredSession};
 use crate::whos_watching::PairedSignIn;
 
 /// How long the TV gives one server to hand over its session, and the
@@ -628,14 +628,57 @@ struct Streams {
     recv: RecvStream,
 }
 
-/// A profile this phone can sign a TV in as: a session of an account on
-/// one of its servers ([`SignInOffer::servers`]).
+/// A profile this phone can sign a TV in as: an account on one of its
+/// servers ([`SignInOffer::servers`]).
 #[derive(Debug, Clone)]
 pub struct SignInChoice {
-    /// The session that makes the sign-in: the TV signs in as its user.
-    pub session: Session,
     /// The server as this phone has it saved, which the TV saves too.
     pub server: PairedServer,
+    pub profile: ChoiceProfile,
+}
+
+/// Who a [`SignInChoice`] signs the TV in as, and whether this phone can.
+#[derive(Debug, Clone)]
+pub enum ChoiceProfile {
+    /// Its session here makes the sign-in: the TV signs in as its user.
+    Session(Session),
+    /// The profile is kept here, but the server ended its session (it
+    /// expired, was revoked, or an admin reset the password). Listed so
+    /// the phone can say "Sign in to <server> again"; approving it gives
+    /// [`SignInFailure::SessionEnded`] and asks the server nothing.
+    SessionEnded(SavedProfile),
+}
+
+impl SignInChoice {
+    /// The session that makes the sign-in; `None` once it has ended.
+    pub fn session(&self) -> Option<&Session> {
+        match &self.profile {
+            ChoiceProfile::Session(session) => Some(session),
+            ChoiceProfile::SessionEnded(_) => None,
+        }
+    }
+
+    /// Whether its session here has ended: sign in to the server again
+    /// before it can sign the TV in.
+    pub fn session_ended(&self) -> bool {
+        matches!(self.profile, ChoiceProfile::SessionEnded(_))
+    }
+
+    /// The account's username there.
+    pub fn username(&self) -> &str {
+        match &self.profile {
+            ChoiceProfile::Session(session) => &session.user().username,
+            ChoiceProfile::SessionEnded(profile) => &profile.username,
+        }
+    }
+
+    /// Who the TV signs in as, for the phone's list: the display name.
+    pub fn display_name(&self) -> &str {
+        match &self.profile {
+            ChoiceProfile::Session(session) => &session.user().display_name,
+            ChoiceProfile::SessionEnded(profile) => &profile.display_name,
+        }
+    }
 }
 
 /// How one server's sign-in went, for the phone to show.
@@ -676,6 +719,10 @@ pub enum SignInFailure {
     /// The phone's session there must confirm it is them first.
     #[error("confirm it's you first")]
     RecentSignInRequired,
+    /// The phone's session there has ended (it expired, was revoked, or
+    /// an admin reset the password): sign in to that server again.
+    #[error("your session there has ended; sign in to it again")]
+    SessionEnded,
     /// The account may not sign a device in there: a guest's, or one
     /// whose role does not allow it.
     #[error("this account can't sign a device in there")]
@@ -719,11 +766,28 @@ impl SignInFailure {
         }
     }
 
+    /// The failure an error from the phone's own offer is, from
+    /// [`SignInOffer::offer`]. As
+    /// [`SignInFailure::of`], but [`SdkError::SignInRequired`] there means
+    /// the phone's session on that server has ended:
+    /// [`SignInFailure::SessionEnded`], "Sign in to it again".
+    /// [`SignInOffer::approve`] reads its errors with this already.
+    ///
+    /// Not part of [`SignInFailure::of`], which also reads a TV's errors:
+    /// a TV told it must sign in has nothing to do on the phone.
+    pub fn of_offer(error: &SdkError) -> Self {
+        match error {
+            SdkError::SignInRequired => Self::SessionEnded,
+            other => Self::of(other),
+        }
+    }
+
     /// The wire's kind for it.
     fn kind(&self) -> FailureKind {
         match self {
             Self::RateLimited => FailureKind::RateLimited,
             Self::RecentSignInRequired => FailureKind::RecentSignInRequired,
+            Self::SessionEnded => FailureKind::SessionEnded,
             Self::NotAllowed => FailureKind::NotAllowed,
             Self::FeatureOff => FailureKind::FeatureOff,
             Self::Unreachable => FailureKind::Unreachable,
@@ -739,11 +803,84 @@ impl SignInFailure {
         match kind {
             FailureKind::RateLimited => Self::RateLimited,
             FailureKind::RecentSignInRequired => Self::RecentSignInRequired,
+            FailureKind::SessionEnded => Self::SessionEnded,
             FailureKind::NotAllowed => Self::NotAllowed,
             FailureKind::FeatureOff => Self::FeatureOff,
             FailureKind::Unreachable => Self::Unreachable,
             FailureKind::Expired => Self::Expired,
             FailureKind::Refused | FailureKind::Unknown => Self::Refused(reason),
+        }
+    }
+}
+
+/// The choices of one server: `live`, the sessions it answered for, and
+/// the profiles `stored` here, read once every server has answered. One
+/// choice per profile, and the later read wins. A live session is listed
+/// only while the read still keeps it, under its username with its
+/// token: one whose token is gone ended after the server answered (it
+/// signed the phone out while another server was still asked), so it is
+/// `SessionEnded`, not a session that no longer works; one forgotten
+/// here, or replaced by another sign-in, is not listed live.
+///
+/// `phone_sign_in` is whether the server has `spoolframe:phone-sign-in`.
+/// A live session needs it known on. An ended profile is left out only when it is known off:
+/// signing in again there could never sign the TV in. Unknown, it is
+/// listed, as it needs no answer from the server.
+///
+/// Guests' profiles (a portable identity's own session) are never
+/// listed, live or ended.
+fn server_choices(
+    card: &PairedServer,
+    live: Vec<Session>,
+    stored: &[StoredSession],
+    phone_sign_in: PhoneSignInSupport,
+) -> Vec<SignInChoice> {
+    let kept: std::collections::HashSet<(&str, &str)> = stored
+        .iter()
+        .filter_map(|s| Some((s.username.as_str(), s.token.as_deref()?)))
+        .collect();
+    let mut choices = Vec::new();
+    if phone_sign_in == PhoneSignInSupport::On {
+        choices.extend(
+            live.into_iter()
+                .filter(|s| !s.user().is_guest())
+                .filter(|s| kept.contains(&(s.user().username.as_str(), s.token.0.as_str())))
+                .map(|session| SignInChoice {
+                    server: card.clone(),
+                    profile: ChoiceProfile::Session(session),
+                }),
+        );
+    }
+    if phone_sign_in != PhoneSignInSupport::Off {
+        choices.extend(
+            stored
+                .iter()
+                .filter(|s| s.token.is_none() && !s.is_guest())
+                .map(|s| SignInChoice {
+                    server: card.clone(),
+                    profile: ChoiceProfile::SessionEnded(SavedProfile::from(s)),
+                }),
+        );
+    }
+    choices
+}
+
+/// Whether a server takes phone sign-ins (`spoolframe:phone-sign-in`), as
+/// this device last heard from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhoneSignInSupport {
+    On,
+    Off,
+    /// Not heard from yet.
+    Unknown,
+}
+
+impl PhoneSignInSupport {
+    fn of(client: &Client, server: EndpointId) -> Self {
+        match client.server_has_feature(server, spoolframe_protocol::Feature::PhoneSignIn) {
+            Some(true) => Self::On,
+            Some(false) => Self::Off,
+            None => Self::Unknown,
         }
     }
 }
@@ -762,7 +899,7 @@ impl Made {
     fn key_of(choice: &SignInChoice) -> ProfileKey {
         (
             choice.server.endpoint_id.clone(),
-            choice.session.user().username.clone(),
+            choice.username().to_owned(),
         )
     }
 
@@ -844,39 +981,49 @@ impl SignInOffer {
         self.device
     }
 
-    /// The profiles this phone can sign the TV in as, one per session,
-    /// for the person to tick: each on a server verified here with its
-    /// server id pinned, of a local account (a portable identity's tied
-    /// to one included, not a guest's), where the server has
-    /// `spoolframe:phone-sign-in`. Each server is asked who its sessions
-    /// are, all at once; one not answering is left out.
+    /// The profiles this phone can sign the TV in as, for the person to
+    /// tick: each on a server verified here with its server id pinned,
+    /// of a local account (a portable identity's tied to one included,
+    /// not a guest's). One per live session where the server has
+    /// `spoolframe:phone-sign-in`: each server is asked who its sessions
+    /// are, all at once, and one not answering has none listed.
+    ///
+    /// Then, for each server, the profiles kept here whose session the
+    /// server ended, [`ChoiceProfile::SessionEnded`]: "Sign in to
+    /// <server> again". Those need no answer from the server, so they are
+    /// listed for one not answering too, and whether it takes phone
+    /// sign-ins is known only once they are signed in again.
     pub async fn servers(&self) -> Result<Vec<SignInChoice>, SdkError> {
-        let saved = servers::load(self.client.inner.storage.as_ref()).await?;
+        let storage = self.client.inner.storage.as_ref();
+        let saved = servers::load(storage).await?;
         let cards: Vec<_> = saved.iter().filter_map(vouched_for).collect();
+        // Every server asked, all at once.
         let asked = join_all(cards.iter().map(|(id, _)| {
             let client = &self.client;
-            async move { client.profiles(&id.to_string()).await }
+            async move {
+                client.profiles(&id.to_string()).await.unwrap_or_else(|e| {
+                    tracing::debug!(server = %id, error = %e, "no sessions listed for a phone sign-in");
+                    Vec::new()
+                })
+            }
+        }))
+        .await;
+        // Then each server's profiles read, once every server has
+        // answered: a session one server ended while a slower one was
+        // still asked is ended in these. One server's profiles that cannot
+        // be read lose only its own choices, as a server not answering
+        // does.
+        let read = join_all(cards.iter().map(|(id, _)| async move {
+            session::load(storage, id).await.unwrap_or_else(|e| {
+                tracing::warn!(server = %id, error = %e, "a server's profiles cannot be read; none listed for a phone sign-in");
+                Vec::new()
+            })
         }))
         .await;
         let mut choices = Vec::new();
-        for ((id, card), profiles) in cards.into_iter().zip(asked) {
-            let profiles = match profiles {
-                Ok(profiles) => profiles,
-                Err(e) => {
-                    tracing::debug!(server = %id, error = %e, "left out of a phone sign-in");
-                    continue;
-                }
-            };
-            choices.extend(
-                profiles
-                    .into_iter()
-                    .filter(|s| s.user().portable_id().is_none())
-                    .filter(|s| s.has_feature(spoolframe_protocol::Feature::PhoneSignIn))
-                    .map(|session| SignInChoice {
-                        session,
-                        server: card.clone(),
-                    }),
-            );
+        for (((id, card), live), stored) in cards.into_iter().zip(asked).zip(read) {
+            let support = PhoneSignInSupport::of(&self.client, id);
+            choices.extend(server_choices(&card, live, &stored, support));
         }
         Ok(choices)
     }
@@ -885,8 +1032,11 @@ impl SignInOffer {
     /// [`SignInOffer::send`]; `remember` trusts the TV for its user
     /// there. The server's refusal is this call's error: on
     /// [`SdkError::RecentSignInRequired`], confirm it is them
-    /// ([`Session::reauth_options`]) and call this again. The same
-    /// profile again replaces its sign-in. At most
+    /// ([`Session::reauth_options`]) and call this again; on
+    /// [`SdkError::SignInRequired`], its session has ended (as for a
+    /// [`ChoiceProfile::SessionEnded`] choice, which is not tried): sign
+    /// in to the server again. The same profile again replaces its
+    /// sign-in. At most
     /// [`MAX_OFFERS`] servers ([`SdkError::InvalidInput`] past it); none
     /// once sent.
     pub async fn offer(&self, choice: &SignInChoice, remember: bool) -> Result<(), SdkError> {
@@ -911,10 +1061,13 @@ impl SignInOffer {
         Ok(())
     }
 
-    /// Ask `choice`'s server for the TV's sign-in.
+    /// Ask `choice`'s server for the TV's sign-in. One whose session has
+    /// ended is [`SdkError::SignInRequired`], with nothing asked.
     async fn make(&self, choice: &SignInChoice, remember: bool) -> Result<Made, SdkError> {
-        let request = choice
-            .session
+        let Some(session) = choice.session() else {
+            return Err(SdkError::SignInRequired);
+        };
+        let request = session
             .feature::<gate::PhoneSignIn>()?
             .offer_device_sign_in(self.device, &self.device_name, self.platform, remember)
             .await?;
@@ -922,8 +1075,8 @@ impl SignInOffer {
             offer: Offer {
                 server: choice.server.clone(),
                 request,
-                user_name: choice.session.user().display_name.clone(),
-                username: Some(choice.session.user().username.clone()),
+                user_name: session.user().display_name.clone(),
+                username: Some(session.user().username.clone()),
             },
             key: Made::key_of(choice),
         })
@@ -1062,7 +1215,8 @@ impl SignInOffer {
     /// [`SignInOffer::offer`] each of `chosen`, all at once, then
     /// [`SignInOffer::send`]: how each went, in `chosen`'s order. One the
     /// phone could not offer is [`SignInOfferOutcome::NotOffered`] and
-    /// stops none of the rest. If none could be offered nothing is sent,
+    /// stops none of the rest: [`SignInFailure::SessionEnded`] for one
+    /// whose session has ended, before or during this call. If none could be offered nothing is sent,
     /// and the TV still waits: confirm it is them where the server asked,
     /// and approve again.
     pub async fn approve(
@@ -1077,17 +1231,23 @@ impl SignInOffer {
             .iter()
             .filter(|c| !signed.contains(&Made::key_of(c)))
             .collect();
-        let mut not_offered: std::collections::HashMap<ProfileKey, SdkError> =
+        let mut not_offered: std::collections::HashMap<ProfileKey, SignInFailure> =
             std::collections::HashMap::new();
         let mut sent = Vec::new();
         if !to_make.is_empty() {
             self.check_open().await?;
-            let made = join_all(to_make.iter().map(|choice| self.make(choice, remember))).await;
+            // One whose session has ended is not tried.
+            let (ended, live): (Vec<&SignInChoice>, Vec<&SignInChoice>) =
+                to_make.iter().copied().partition(|c| c.session_ended());
+            for choice in ended {
+                not_offered.insert(Made::key_of(choice), SignInFailure::SessionEnded);
+            }
+            let made = join_all(live.iter().map(|choice| self.make(choice, remember))).await;
             {
                 let mut offers = self.offers.lock().await;
-                for (choice, made) in to_make.iter().zip(made) {
+                for (choice, made) in live.iter().zip(made) {
                     if let Err(e) = made.and_then(|made| Made::keep(&mut offers, made)) {
-                        not_offered.insert(Made::key_of(choice), e);
+                        not_offered.insert(Made::key_of(choice), SignInFailure::of_offer(&e));
                     }
                 }
             }
@@ -1102,7 +1262,7 @@ impl SignInOffer {
                 let key = Made::key_of(choice);
                 let outcome = match not_offered.remove(&key) {
                     _ if signed.contains(&key) => SignInOfferOutcome::SignedIn,
-                    Some(e) => SignInOfferOutcome::NotOffered(SignInFailure::of(&e)),
+                    Some(failure) => SignInOfferOutcome::NotOffered(failure),
                     None => match sent.iter().find(|(k, _)| *k == key) {
                         Some((_, result)) => return result.clone(),
                         None => SignInOfferOutcome::Failed(SignInFailure::Refused(
@@ -1113,7 +1273,7 @@ impl SignInOffer {
                 SignInOfferResult {
                     endpoint_id: choice.server.endpoint_id.clone(),
                     server_name: choice.server.name.clone(),
-                    user_name: choice.session.user().display_name.clone(),
+                    user_name: choice.display_name().to_owned(),
                     outcome,
                 }
             })

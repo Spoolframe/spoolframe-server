@@ -103,7 +103,7 @@ async fn a_tv_is_signed_in_to_the_servers_picked_on_the_phone() {
     let mut choices = offer.servers().await.unwrap();
     assert_eq!(choices.len(), 3);
     for choice in &choices {
-        assert_eq!(choice.session.user().username, "alice");
+        assert_eq!(choice.username(), "alice");
     }
     // The person leaves the third unticked.
     let picked: Vec<String> = [&servers[0], &servers[1]].iter().map(|s| id(s)).collect();
@@ -244,7 +244,12 @@ async fn an_old_phone_session_confirms_it_is_them_first() {
         ),
         "{results:?}"
     );
-    choices[0].session.confirm_password(PASSWORD).await.unwrap();
+    choices[0]
+        .session()
+        .unwrap()
+        .confirm_password(PASSWORD)
+        .await
+        .unwrap();
     let (results, signed) = tokio::join!(offer.approve(&choices, false), async {
         held(&shown).await.confirm().await
     });
@@ -309,7 +314,12 @@ async fn a_server_that_failed_is_retried_alone_with_no_new_scan() {
         .into_iter()
         .filter(|c| c.server.endpoint_id == stale)
         .collect();
-    again[0].session.confirm_password(PASSWORD).await.unwrap();
+    again[0]
+        .session()
+        .unwrap()
+        .confirm_password(PASSWORD)
+        .await
+        .unwrap();
     let retried = offer.approve(&again, false).await.unwrap();
     assert_eq!(retried.len(), 1);
     assert!(
@@ -382,7 +392,12 @@ async fn a_server_retried_after_failing_on_the_tv_counts_once() {
         .collect();
     let mut retried = offer.approve(&again, false).await.unwrap();
     if retried[0].outcome == SignInOfferOutcome::NotOffered(SignInFailure::RecentSignInRequired) {
-        again[0].session.confirm_password(PASSWORD).await.unwrap();
+        again[0]
+            .session()
+            .unwrap()
+            .confirm_password(PASSWORD)
+            .await
+            .unwrap();
         retried = offer.approve(&again, false).await.unwrap();
     }
     assert_eq!(
@@ -450,7 +465,12 @@ async fn a_retry_lands_after_the_code_s_screen_is_gone_and_a_new_code_shows() {
         .into_iter()
         .filter(|c| c.server.endpoint_id == stale)
         .collect();
-    again[0].session.confirm_password(PASSWORD).await.unwrap();
+    again[0]
+        .session()
+        .unwrap()
+        .confirm_password(PASSWORD)
+        .await
+        .unwrap();
     let retried = offer.approve(&again, false).await.unwrap();
     assert_eq!(
         retried[0].outcome,
@@ -730,7 +750,12 @@ async fn a_held_retry_rejected_then_cancelled_is_declined_on_the_phone() {
             "{results:?}"
         );
         for choice in &choices {
-            choice.session.confirm_password(PASSWORD).await.unwrap();
+            choice
+                .session()
+                .unwrap()
+                .confirm_password(PASSWORD)
+                .await
+                .unwrap();
         }
         let (results, ()) = tokio::join!(offer.approve(&choices, false), async {
             let held = held(&shown).await;
@@ -754,6 +779,280 @@ async fn a_held_retry_rejected_then_cancelled_is_declined_on_the_phone() {
         assert!(tv.servers().await.unwrap().is_empty());
         tv.close().await;
     }
+    phone.close().await;
+    stop(servers).await;
+}
+
+/// An admin resets alice's password on `server`, as Companion testing
+/// did: every session she signed in to with a password there ends, the
+/// phone's among them.
+async fn reset_password(server: &TestServer) {
+    let phc = spoolframe_server::auth::hash_password("one time")
+        .await
+        .unwrap();
+    // 2100-01-01: the one-time password does not run out in the test.
+    server
+        .store
+        .reset_password("alice", &phc, 4_102_444_800)
+        .await
+        .unwrap();
+}
+
+/// The phone's session on one of two servers ends after it listed them:
+/// approving both, that one is not offered, typed `SessionEnded` ("Sign
+/// in to it again", not "Couldn't reach"), and the other signs the TV in.
+#[tokio::test]
+async fn a_session_that_ends_before_approving_is_session_ended() {
+    let servers = servers("sdk-psi-ended", 2).await;
+    let phone = phone(&servers).await;
+    let tv = new_client("tv", Platform::Tvos).await;
+    let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+    let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
+    let choices = offer.servers().await.unwrap();
+    assert_eq!(choices.len(), 2);
+    assert!(choices.iter().all(|c| !c.session_ended()), "{choices:?}");
+    reset_password(&servers[0]).await;
+
+    let (results, signed) = tokio::join!(offer.approve(&choices, false), async {
+        held(&shown).await.confirm().await
+    });
+    let results = results.unwrap();
+    let outcome_of = |server: &TestServer| {
+        results
+            .iter()
+            .find(|r| r.endpoint_id == id(server))
+            .map(|r| r.outcome.clone())
+            .unwrap()
+    };
+    assert_eq!(
+        outcome_of(&servers[0]),
+        SignInOfferOutcome::NotOffered(SignInFailure::SessionEnded)
+    );
+    assert_eq!(outcome_of(&servers[1]), SignInOfferOutcome::SignedIn);
+    let signed = signed.unwrap();
+    assert_eq!(signed.sessions.len(), 1);
+    assert_eq!(signed.sessions[0].server().to_string(), id(&servers[1]));
+    tv.close().await;
+    phone.close().await;
+    stop(servers).await;
+}
+
+/// A server whose session on the phone has ended is listed, not left
+/// out: its profile marked session-ended, for "Sign in to <server>
+/// again". Approving it is `SessionEnded` with nothing tried, and the
+/// other server signs the TV in.
+#[tokio::test]
+async fn a_server_whose_session_ended_is_listed_as_such() {
+    let servers = servers("sdk-psi-listed", 2).await;
+    let phone = phone(&servers).await;
+    reset_password(&servers[0]).await;
+    let tv = new_client("tv", Platform::Tvos).await;
+    let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+    let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
+    let choices = offer.servers().await.unwrap();
+    assert_eq!(choices.len(), 2, "{choices:?}");
+    let ended = choices
+        .iter()
+        .find(|c| c.server.endpoint_id == id(&servers[0]))
+        .unwrap();
+    assert!(ended.session_ended());
+    assert!(ended.session().is_none());
+    assert_eq!(ended.username(), "alice");
+    assert_eq!(ended.display_name(), "Alice");
+    let live = choices
+        .iter()
+        .find(|c| c.server.endpoint_id == id(&servers[1]))
+        .unwrap();
+    assert!(!live.session_ended());
+
+    let (results, signed) = tokio::join!(offer.approve(&choices, false), async {
+        held(&shown).await.confirm().await
+    });
+    let results = results.unwrap();
+    let ended = results
+        .iter()
+        .find(|r| r.endpoint_id == id(&servers[0]))
+        .unwrap();
+    assert_eq!(
+        ended.outcome,
+        SignInOfferOutcome::NotOffered(SignInFailure::SessionEnded)
+    );
+    assert_eq!(ended.user_name, "Alice");
+    let signed = signed.unwrap();
+    assert_eq!(signed.sessions.len(), 1);
+    assert_eq!(signed.sessions[0].server().to_string(), id(&servers[1]));
+    // Offering it alone is the same error, with nothing asked.
+    let alone = offer
+        .offer(choices.iter().find(|c| c.session_ended()).unwrap(), false)
+        .await;
+    assert!(matches!(alone, Err(SdkError::SignInRequired)), "{alone:?}");
+    tv.close().await;
+    phone.close().await;
+    stop(servers).await;
+}
+
+/// An app that offers one server at a time (`offer`, then `send`) reads
+/// the offer's error as `approve` does: a session that ended is
+/// `SessionEnded`, "Sign in to it again", not a refusal with its text.
+#[tokio::test]
+async fn an_app_offering_alone_reads_an_ended_session_as_session_ended() {
+    let servers = servers("sdk-psi-offer-ended", 1).await;
+    let phone = phone(&servers).await;
+    let tv = new_client("tv", Platform::Tvos).await;
+    let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+    let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
+    let choices = offer.servers().await.unwrap();
+    assert_eq!(choices.len(), 1);
+    reset_password(&servers[0]).await;
+    let error = offer.offer(&choices[0], false).await.unwrap_err();
+    assert_eq!(
+        SignInFailure::of_offer(&error),
+        SignInFailure::SessionEnded,
+        "{error:?}"
+    );
+    offer.decline().await.unwrap();
+    tv.close().await;
+    phone.close().await;
+    stop(servers).await;
+}
+
+/// The phone's storage, with one server's sessions read held back: the
+/// first read of `held`'s sessions (its asking, in `servers()`) waits
+/// until `watched`'s sessions have been read twice (that server asked,
+/// then read again) or a while has passed. Then `watched`'s sessions are
+/// ended here, as the SDK records a server signing the phone out, and the
+/// held read goes on.
+struct HeldRead {
+    inner: MemoryStorage,
+    armed: std::sync::atomic::AtomicBool,
+    counting: std::sync::atomic::AtomicBool,
+    held: String,
+    watched: String,
+    watched_reads: std::sync::atomic::AtomicUsize,
+    read: tokio::sync::Notify,
+}
+
+impl HeldRead {
+    fn new(held: &TestServer, watched: &TestServer) -> Self {
+        let key = |server: &TestServer| spoolframe_client_sdk::storage::keys::sessions(&id(server));
+        Self {
+            inner: MemoryStorage::default(),
+            armed: Default::default(),
+            counting: Default::default(),
+            held: key(held),
+            watched: key(watched),
+            watched_reads: Default::default(),
+            read: Default::default(),
+        }
+    }
+
+    /// Hold the next read of the held server's sessions, and count the
+    /// watched server's reads from now.
+    fn arm(&self) {
+        use std::sync::atomic::Ordering;
+        self.counting.store(true, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// End every session kept for the watched server, keeping its
+    /// profiles: what the SDK writes when that server signs it out.
+    async fn end_watched(&self) {
+        use spoolframe_client_sdk::Storage;
+        let bytes = self.inner.secret(&self.watched).await.unwrap().unwrap();
+        let mut kept: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        for session in &mut kept {
+            session["token"] = serde_json::Value::Null;
+        }
+        self.inner
+            .set_secret(&self.watched, Some(serde_json::to_vec(&kept).unwrap()))
+            .await
+            .unwrap();
+    }
+}
+
+#[async_trait::async_trait]
+impl spoolframe_client_sdk::Storage for HeldRead {
+    async fn secret(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, spoolframe_client_sdk::storage::StorageError> {
+        use std::sync::atomic::Ordering;
+        if key == self.held && self.armed.swap(false, Ordering::SeqCst) {
+            let twice = async {
+                while self.watched_reads.load(Ordering::SeqCst) < 2 {
+                    self.read.notified().await;
+                }
+            };
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), twice).await;
+            self.end_watched().await;
+        }
+        let value = self.inner.secret(key).await;
+        if key == self.watched && self.counting.load(Ordering::SeqCst) {
+            self.watched_reads.fetch_add(1, Ordering::SeqCst);
+            self.read.notify_waiters();
+        }
+        value
+    }
+    async fn set_secret(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+    ) -> Result<(), spoolframe_client_sdk::storage::StorageError> {
+        self.inner.set_secret(key, value).await
+    }
+    async fn data(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, spoolframe_client_sdk::storage::StorageError> {
+        self.inner.data(key).await
+    }
+    async fn set_data(
+        &self,
+        key: &str,
+        value: Option<Vec<u8>>,
+    ) -> Result<(), spoolframe_client_sdk::storage::StorageError> {
+        self.inner.set_data(key, value).await
+    }
+}
+
+/// Server A answers, then signs the phone out while server B is still
+/// being asked: the profiles are read once every server has answered,
+/// so A's is listed `SessionEnded`, not as a live session that no longer
+/// works.
+#[tokio::test]
+async fn a_server_that_signs_the_phone_out_while_another_is_asked_is_listed_ended() {
+    let servers = servers("sdk-psi-cross", 2).await;
+    let storage = Arc::new(HeldRead::new(&servers[1], &servers[0]));
+    let phone = support::sdk_client(storage.clone(), device("phone", Platform::Ios))
+        .await
+        .unwrap();
+    for server in &servers {
+        let addrs = server.server.addr().ip_addrs().copied().collect();
+        phone.add_address(&id(server), addrs).unwrap();
+        phone.connect(&id(server)).await.unwrap();
+        phone.pin(&id(server), true).await.unwrap();
+        phone
+            .sign_in(&id(server), "alice", PASSWORD, false)
+            .await
+            .unwrap();
+    }
+    let tv = new_client("tv", Platform::Tvos).await;
+    let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+    let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
+    storage.arm();
+    let choices = offer.servers().await.unwrap();
+    let state = |server: &TestServer| {
+        let found: Vec<bool> = choices
+            .iter()
+            .filter(|c| c.server.endpoint_id == id(server))
+            .map(|c| c.session_ended())
+            .collect();
+        found
+    };
+    assert_eq!(state(&servers[0]), [true], "{choices:?}");
+    assert_eq!(state(&servers[1]), [false], "{choices:?}");
+    offer.decline().await.unwrap();
+    tv.close().await;
     phone.close().await;
     stop(servers).await;
 }

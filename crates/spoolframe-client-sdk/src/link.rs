@@ -314,6 +314,15 @@ impl Link {
         self.info.lock().clone()
     }
 
+    /// Whether the latest Hello listed `feature`, without copying the
+    /// rest of it; `None` before the first.
+    pub(crate) fn has_feature(&self, feature: spoolframe_protocol::Feature) -> Option<bool> {
+        self.info
+            .lock()
+            .as_ref()
+            .map(|info| info.features.contains(feature))
+    }
+
     fn set(&self, conn: Option<Arc<ServerConnection>>, state: ConnectionState) {
         if let Some(conn) = &conn {
             *self.info.lock() = Some(conn.info.clone());

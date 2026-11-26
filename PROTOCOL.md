@@ -724,8 +724,9 @@ One bidirectional stream, each frame a client-protocol frame of at most
   `{"type": "signed_in"}` or `{"type": "failed", "reason": "…", "kind":
   k}` (`reason` at most 200 characters). `k` says what kind of failure,
   for the phone to act on: `rate_limited` (too many sign-ins at once or
-  waiting there), `recent_sign_in_required`, `not_allowed` (a guest, or
-  a role), `feature_off`, `unreachable`, `expired` (the grant ran out
+  waiting there), `recent_sign_in_required`, `session_ended` (the
+  phone's session there has ended; since 0.17.6), `not_allowed` (a
+  guest, or a role), `feature_off`, `unreachable`, `expired` (the grant ran out
   before the TV redeemed it) or `refused` (`reason` is the server's
   words). A TV before `kind` leaves it out, and a kind a phone does not
   know reads as `refused` with `reason`.
@@ -817,20 +818,45 @@ Phone side:
 
 - `Client::scan_phone_sign_in(link)` gives a `SignInOffer`:
   `device_name()`, `platform()`, `client_name()`, `device()`.
-- `SignInOffer::servers()` lists a `SignInChoice { session, server }`
-  per session this phone holds on a server it has verified with its
-  server id pinned, of a local account, where the server has the
-  feature.
+- `SignInOffer::servers()` lists a `SignInChoice { server, profile }`
+  for each server this phone has verified with its server id pinned,
+  of a local account (not a guest's). `profile` is
+  `ChoiceProfile::Session(session)` per live session where the server
+  has the feature, then `ChoiceProfile::SessionEnded(SavedProfile)` per
+  profile kept here whose session the server ended (it expired, was
+  revoked, or an admin reset the password): the app says "Sign in to
+  <server> again" without comparing against `saved_profiles`. One
+  profile is one choice: a session the server answered for and that
+  ended before the list was done (its token gone when the profiles are
+  read, once every server has answered) is `SessionEnded`, and one
+  forgotten here or signed in again since is not listed live. Ended profiles need no answer
+  from the server, so one that does not answer still has them listed;
+  one that has said it lacks the feature lists none. A guest's profile
+  (a portable identity's own, kept under its id) is never listed.
+  `session()`, `session_ended()`, `username()` and
+  `display_name()` read either kind. Before 0.17.6 the choice was
+  `{ session, server }` and a server whose session had ended was left
+  out.
 - `SignInOffer::offer(&choice, remember)` makes one sign-in
   (`On<PhoneSignIn>::offer_device_sign_in`), and `send()` hands the TV
   all made and gives a `SignInOfferResult` each. `approve(&chosen,
   remember)` does both: a server that refuses is
-  `SignInOfferOutcome::NotOffered(error)`, and with none offered
+  `SignInOfferOutcome::NotOffered(failure)`, and with none offered
   nothing is sent and the TV keeps waiting. `decline()` tells the TV no.
+- A `SessionEnded` choice is not tried: `offer` is
+  `SdkError::SignInRequired`, and `approve` gives it
+  `NotOffered(SignInFailure::SessionEnded)`. A session that ends after
+  `servers()` (the server answers `unauthenticated` to the offer) gives
+  the same, not `Refused` with the error's text. An app that calls
+  `offer` and `send` itself reads `offer`'s errors with
+  `SignInFailure::of_offer` for the same answer; `SignInFailure::of`,
+  which also reads a TV's errors, keeps `SignInRequired` a refusal.
 
 The FFI has `SpoolClient.start_phone_sign_in(name, relay)` and
 `SpoolClient.scan_phone_sign_in(link)`, giving `SpoolPhoneSignIn` and
-`SpoolSignInOffer` (whose `servers()` are `SpoolSignInChoice`s).
+`SpoolSignInOffer` (whose `servers()` are `SpoolSignInChoice`s:
+`session()` is null and `session_ended()` true for one whose session
+has ended; `SignInFailure.SESSION_ENDED` in its results).
 
 ## Trusted devices
 

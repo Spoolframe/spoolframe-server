@@ -238,24 +238,9 @@ async fn end_device(
 }
 
 /// Whether a connection given back to the pool may be handed out again:
-/// not when sqlx still counts it inside a transaction.
-///
-/// A COMMIT that fails with SQLITE_FULL or an I/O error (a full disk:
-/// the WAL cannot grow) makes SQLite roll the whole transaction back by
-/// itself. sqlx is not told: its own ROLLBACK then fails with "no
-/// transaction is active", and it goes on counting the connection one
-/// transaction deep. Its next transaction on that connection is then a
-/// SAVEPOINT, which SQLite runs as a real transaction, and the
-/// `ROLLBACK TO` that sqlx sends when one fails leaves it, and the write
-/// lock it took, open: every other connection's write then fails with
-/// "database is locked" until the server restarts (2026-10-08). Closing
-/// the connection ends whatever SQLite still has open on it; the pool
-/// opens a new one when it needs one.
-///
-/// sqlx 0.9.1 asks SQLite whether a transaction is still open and stops
-/// counting one that is not, so this no longer meets the case itself.
-/// It stays as a guard: a connection inside a transaction must never go
-/// back to the pool, whoever lost count.
+/// not while sqlx counts it inside a transaction, which once left a write
+/// lock open after a full disk (2026-10-08). sqlx 0.9.1 handles that
+/// case itself; this stays as a guard.
 async fn reusable(conn: &mut sqlx::SqliteConnection) -> Result<bool, sqlx::Error> {
     use sqlx::Connection;
     // Most connections come back outside any transaction, and sqlx's

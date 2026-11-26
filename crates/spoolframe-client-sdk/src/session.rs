@@ -55,6 +55,17 @@ pub(crate) struct StoredSession {
 }
 
 impl StoredSession {
+    /// A guest's profile: a portable identity's own session, which a
+    /// device keeps under the identity's id (hex) and with that identity.
+    /// A local account tied to an identity keeps its own username.
+    pub(crate) fn is_guest(&self) -> bool {
+        self.portable.is_some_and(|id| {
+            self.username
+                .parse::<PortableUserId>()
+                .is_ok_and(|named| named == id)
+        })
+    }
+
     /// Keep what `user` says of the role, and its name: true if either
     /// changed.
     pub(crate) fn note_user(&mut self, user: &UserSummary) -> bool {

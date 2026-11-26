@@ -437,11 +437,13 @@ per target (outside Nix's SDK and toolchain: unset `SDKROOT`,
 `DEVELOPER_DIR`, `NIX_CFLAGS_COMPILE`, `NIX_LDFLAGS`, `CC`, `CXX`, `LD`).
 The four `.swift` files go into the Swift package beside it.
 
-tvOS, and iOS's IPv6 flags, need iroh's `netdev` 0.46.3 and `netwatch`
-0.19.3 patched (with `libc` at most 0.2.189). This workspace does not
-carry those patches: build the Apple slices from a workspace that does
-(the iOS repository's `rust/`, with this crate as a git dependency), and
-its `[patch.crates-io]` applies.
+tvOS, and iOS's IPv6 flags, need iroh's `netdev` 0.47.0 and `netwatch`
+0.20.2 patched. This workspace does not carry those patches: the iOS
+repository's `rust/` vendors both, with the changes gated on
+`any(target_os = "ios", target_os = "tvos")`, and its
+`[patch.crates-io]` applies. Build the Apple slices from that workspace,
+with this crate as a git dependency. The changes are offered upstream
+as shellrow/netdev#201 and n0-computer/net-tools#282.
 
 ### AAR (Android)
 

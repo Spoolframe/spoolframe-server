@@ -168,7 +168,9 @@ impl SpoolPhoneSignIn {
     }
 }
 
-/// A profile the phone can sign the TV in as: one session on one server.
+/// A profile the phone can sign the TV in as: an account on one server.
+/// One whose session here has ended (`session_ended()`) is listed too,
+/// for "Sign in to <server> again"; approving it is `SessionEnded`.
 #[derive(uniffi::Object)]
 pub struct SpoolSignInChoice(sdk::SignInChoice);
 
@@ -183,9 +185,26 @@ impl SpoolSignInChoice {
         self.0.server.name.clone()
     }
 
+    /// The account's username there.
+    pub fn username(&self) -> String {
+        self.0.username().to_owned()
+    }
+    /// Who the TV signs in as: the display name.
+    pub fn user_name(&self) -> String {
+        self.0.display_name().to_owned()
+    }
     /// The session that signs the TV in: "Confirm it's you" runs on it.
-    pub fn session(&self) -> Arc<SpoolSession> {
-        Arc::new(SpoolSession::new(self.0.session.clone()))
+    /// None once it has ended.
+    pub fn session(&self) -> Option<Arc<SpoolSession>> {
+        self.0
+            .session()
+            .map(|session| Arc::new(SpoolSession::new(session.clone())))
+    }
+    /// The server ended this profile's session (it expired, was revoked,
+    /// or an admin reset the password): sign in to the server again
+    /// before it can sign the TV in.
+    pub fn session_ended(&self) -> bool {
+        self.0.session_ended()
     }
 }
 
@@ -217,6 +236,8 @@ pub enum SignInFailure {
     RateLimited,
     /// "Confirm it's you" on the profile's session first.
     RecentSignInRequired,
+    /// The phone's session there has ended: "Sign in to <server> again".
+    SessionEnded,
     /// The account may not sign a device in there (a guest, or a role).
     NotAllowed,
     /// The server does not take sign-ins from a phone.
@@ -237,6 +258,7 @@ impl SignInFailure {
         let reason = match failure {
             sdk::SignInFailure::RateLimited => Self::RateLimited,
             sdk::SignInFailure::RecentSignInRequired => Self::RecentSignInRequired,
+            sdk::SignInFailure::SessionEnded => Self::SessionEnded,
             sdk::SignInFailure::NotAllowed => Self::NotAllowed,
             sdk::SignInFailure::FeatureOff => Self::FeatureOff,
             sdk::SignInFailure::Unreachable => Self::Unreachable,
@@ -299,7 +321,8 @@ impl SpoolSignInOffer {
         self.0.client_name().to_owned()
     }
 
-    /// The profiles this phone can sign the TV in as, one per session.
+    /// The profiles this phone can sign the TV in as: one per session,
+    /// then those whose session has ended.
     pub async fn servers(&self) -> Result<Vec<Arc<SpoolSignInChoice>>, SpoolError> {
         let offer = self.0.clone();
         let choices = run(async move { offer.servers().await }).await?;

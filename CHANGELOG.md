@@ -10,6 +10,28 @@
   0.9.1 and rusqlite 0.43), which fixes RUSTSEC-2026-0459. The SDK now
   needs rusqlite 0.42 or later; the advisory is no longer ignored.
 - Changed, SDK: bip39 3. Recovery phrases work the same as before.
+- Fixed, SDK and FFI: signing a TV in with a phone said "Couldn't reach
+  the TV" for a server whose session on the phone had ended (an admin
+  reset the password, say). New `SignInFailure::SessionEnded` ("Sign in
+  to it again"): `approve` gives `NotOffered(SessionEnded)` for it, and
+  the other servers still sign the TV in. An app calling `offer` and
+  `send` itself gets the same from `offer`'s error with
+  `SignInFailure::of_offer(&error)`.
+  On the wire, `FailureKind` has `session_ended`; an older peer reads
+  it as unknown.
+- BREAKING (SDK, FFI): `SignInOffer::servers()` lists a server whose
+  session on the phone has ended, instead of leaving it out.
+  `SignInChoice` is `{ server, profile }`, `profile` a `ChoiceProfile`:
+  `Session(Session)`, or `SessionEnded(SavedProfile)` for "Sign in to
+  <server> again"; `session()`, `session_ended()`, `username()` and
+  `display_name()` read either. Such a choice is not tried. In the FFI,
+  `SpoolSignInChoice.session()` is optional, with `session_ended()`,
+  `username()` and `user_name()` beside it.
+- Added, FFI: `SpoolClient.saved_profiles` tells, offline, whose session
+  ended and how they sign in again. `SavedProfileName` has
+  `session_ended`, `method` (`SignInMethod`), and for a portable
+  profile `portable` and `portable_fingerprint` (as `PortableProfile`
+  has them), for `sign_in_portable` with no password asked.
 
 ## 0.17.5
 

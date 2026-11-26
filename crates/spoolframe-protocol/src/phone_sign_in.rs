@@ -169,6 +169,11 @@ pub enum FailureKind {
     RateLimited,
     /// The phone's session there must confirm it is them first.
     RecentSignInRequired,
+    /// The phone's session there has ended (it expired, was revoked, or
+    /// an admin reset the password): sign in to that server again on
+    /// the phone first. Read as [`FailureKind::Unknown`] by a build
+    /// before it was added.
+    SessionEnded,
     /// The account may not sign a device in there (a guest, or a role).
     NotAllowed,
     /// The server does not take phone sign-ins.
@@ -334,6 +339,7 @@ mod tests {
         for (kind, wire) in [
             (FailureKind::RateLimited, "rate_limited"),
             (FailureKind::RecentSignInRequired, "recent_sign_in_required"),
+            (FailureKind::SessionEnded, "session_ended"),
             (FailureKind::NotAllowed, "not_allowed"),
             (FailureKind::FeatureOff, "feature_off"),
             (FailureKind::Unreachable, "unreachable"),
