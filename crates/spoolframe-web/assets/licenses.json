@@ -2999,6 +2999,22 @@
 },
 {
 "copyright": [
+"Copyright (c) Rust and WebAssembly Working Group, Elina"
+],
+"group": "crates",
+"license": "MIT OR Apache-2.0",
+"name": "gloo-net",
+"ships": [
+"web"
+],
+"texts": {
+"Apache-2.0": 0,
+"MIT": 1
+},
+"version": "0.8.0"
+},
+{
+"copyright": [
 "Copyright (c) Rust and WebAssembly Working Group"
 ],
 "group": "crates",
@@ -3044,6 +3060,22 @@
 "MIT": 1
 },
 "version": "0.2.0"
+},
+{
+"copyright": [
+"Copyright (c) Rust and WebAssembly Working Group"
+],
+"group": "crates",
+"license": "MIT OR Apache-2.0",
+"name": "gloo-utils",
+"ships": [
+"web"
+],
+"texts": {
+"Apache-2.0": 0,
+"MIT": 1
+},
+"version": "0.3.1"
 },
 {
 "copyright": [
@@ -3929,7 +3961,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.3.103"
+"version": "0.3.107"
 },
 {
 "copyright": [
@@ -8997,7 +9029,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.2.126"
+"version": "0.2.130"
 },
 {
 "copyright": [
@@ -9013,7 +9045,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.4.76"
+"version": "0.4.80"
 },
 {
 "copyright": [
@@ -9029,7 +9061,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.2.126"
+"version": "0.2.130"
 },
 {
 "copyright": [
@@ -9061,7 +9093,7 @@
 "Apache-2.0": 10,
 "MIT": 1
 },
-"version": "0.3.103"
+"version": "0.3.107"
 },
 {
 "copyright": [

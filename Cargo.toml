@@ -189,9 +189,9 @@ m3u8-rs = "6"
 # (devenv.nix and nix/package.nix name the same versions).
 dioxus = { version = "=0.7.10", features = ["router", "web"] }
 dioxus-logger = "=0.7.10"
-wasm-bindgen = "=0.2.126"
+wasm-bindgen = "=0.2.130"
 web-sys = { version = "0.3", features = ["Window", "Location", "RequestCredentials"] }
-gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
+gloo-net = { version = "0.8", default-features = false, features = ["http", "json"] }
 # The server embeds the bundle (feature `embed-web`).
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 

@@ -103,8 +103,8 @@ in {
     util-linux
     iproute2
     # The web UI (P3-01): `dx bundle`, its wasm-bindgen, and Tailwind.
-    (dioxusPackages."0.7.10".override {wasm-bindgen-version = "0.2.126";})
-    dioxusPackages.wasm-bindgen-versions."0.2.126"
+    (dioxusPackages."0.7.10".override {wasm-bindgen-version = "0.2.130";})
+    dioxusPackages.wasm-bindgen-versions."0.2.130"
     tailwindcss_4
     # wasm-opt, which dx runs on the release bundle.
     binaryen

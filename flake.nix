@@ -43,8 +43,8 @@
           inherit lib craneLib ffmpeg;
           # A dirty tree says so; a tree without git has no revision.
           rev = inputs.self.shortRev or inputs.self.dirtyShortRev or null;
-          dioxus-cli = dioxusPackages."0.7.10".override {wasm-bindgen-version = "0.2.126";};
-          wasm-bindgen-cli = dioxusPackages.wasm-bindgen-versions."0.2.126";
+          dioxus-cli = dioxusPackages."0.7.10".override {wasm-bindgen-version = "0.2.130";};
+          wasm-bindgen-cli = dioxusPackages.wasm-bindgen-versions."0.2.130";
         };
       in {
         packages =
