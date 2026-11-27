@@ -237,7 +237,33 @@ fn catalog() -> Vec<Value> {
         show("200", "The Bear", 1, 1),
         season("300", "200", "The Bear", 1),
         bear,
+        album(),
+        // Discovery's tracks as a Plex may list them: discs interleaved.
+        track("402", Some(2), 1),
+        track("401", Some(1), 2),
+        track("403", Some(1), 1),
+        track("404", None, 3),
     ]
+}
+
+/// An album, Discovery, whose tracks Plex lists out of disc order. In
+/// the TV Shows section, as no test lists that section's albums.
+fn album() -> Value {
+    json!({
+        "ratingKey": "400", "type": "album", "title": "Discovery",
+        "librarySectionID": "1", "guid": "plex://album/400",
+        "parentRatingKey": "399", "parentTitle": "Daft Punk", "leafCount": 4,
+    })
+}
+
+fn track(key: &str, disc: Option<u32>, index: u32) -> Value {
+    json!({
+        "ratingKey": key, "type": "track", "title": format!("Track {key}"),
+        "librarySectionID": "1", "guid": format!("plex://track/{key}"),
+        "parentRatingKey": "400", "parentTitle": "Discovery",
+        "grandparentRatingKey": "399", "grandparentTitle": "Daft Punk",
+        "parentIndex": disc, "index": index,
+    })
 }
 
 /// The files on this host: every one but "24 Days", "KonoSuba OVA" and
@@ -890,4 +916,40 @@ fn png() -> Vec<u8> {
         .write_to(&mut out, image::ImageFormat::Png)
         .unwrap();
     out.into_inner()
+}
+
+/// The item page (its reply and its Children tab) and the children rows
+/// show an album's tracks as a client gets them: in disc order, not
+/// Plex's.
+#[tokio::test]
+async fn an_album_s_tracks_show_in_disc_order() {
+    let s = setup("album-order").await;
+    let seen = s.root.catalog_item("plex:album:400".into()).await.unwrap();
+    let shown: Vec<&str> = seen.reply["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    let order = [
+        "plex:track:403",
+        "plex:track:401",
+        "plex:track:404",
+        "plex:track:402",
+    ];
+    assert_eq!(shown, order);
+    // The item page's Children tab: the same order.
+    let tab: Vec<String> = seen
+        .children
+        .iter()
+        .map(|r| r.item.id().to_string())
+        .collect();
+    assert_eq!(tab, order);
+    let rows = s
+        .root
+        .catalog_children("plex:1".into(), "plex:album:400".into())
+        .await
+        .unwrap();
+    let rows: Vec<String> = rows.iter().map(|r| r.item.id().to_string()).collect();
+    assert_eq!(rows, order);
 }

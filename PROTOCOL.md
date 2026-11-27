@@ -2331,6 +2331,12 @@ builtin, owner_name, artwork }]`: the playlists the user sees that hold
 a movie, episode or track itself, any of a season's or show's episodes,
 or any of an album's or artist's tracks; empty when none does.
 
+An album's `children` come in the order it plays: by disc, then by
+track number, whatever order its Plex or its paired server listed them
+in (since 0.18.1). A track with no disc counts as disc 1; one with no
+number comes after the numbered ones on its disc; ties keep the
+catalog's order. A client plays them as given.
+
 ### Events
 
 To a connection, for each user it has made a request as on that

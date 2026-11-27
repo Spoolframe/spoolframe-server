@@ -10,6 +10,12 @@
   in flight now holds once that round ends, and an `approve` of only
   servers already signed in finishes rather than leaving the TV
   waiting two minutes.
+- Fixed, server: an album's tracks came in the order its Plex or its
+  paired server listed them, which could interleave the discs. `Item`
+  now gives an album's children by disc, then track number, so every
+  client plays disc 1 before disc 2. A track with no disc counts as disc
+  1, one with no number goes last on its disc. The admin catalog's item
+  page and child rows show the same order.
 
 ## 0.18.0
 

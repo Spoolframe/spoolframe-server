@@ -338,6 +338,37 @@ impl Catalog for LiveCatalog {
     }
 }
 
+/// An album's tracks in the order it plays: by disc, then by track
+/// number. Plex lists an album's children in an order of its own, and a
+/// paired server's come as that server sent them, so neither is relied
+/// on: [`Composite`] gives every caller (a client's queue, Shortcuts, the
+/// Mac and TV apps, the admin's catalog) disc order. A track with no disc
+/// counts as disc 1, as Plex's own `parentIndex` default does; one with
+/// no number comes after the numbered ones on its disc. Ties keep the
+/// catalog's order. Anything but an album is left as it is.
+pub(crate) fn in_album_order(found: &mut ItemWithChildren) {
+    if matches!(found.item, Item::Album(_)) {
+        found.children.sort_by_key(album_order);
+    }
+}
+
+/// An album's child rows, as the admin's catalog lists them, in
+/// [`in_album_order`]'s order.
+pub(crate) fn sort_rows(rows: &mut [spoolframe_catalog::inspect::Row]) {
+    rows.sort_by_key(|row| album_order(&row.item));
+}
+
+/// Where `item` goes in an album's order: tracks before anything else,
+/// then disc (none is disc 1), then numbered before unnumbered, then the
+/// number. The flags are apart from the numbers, so no number a tag can
+/// hold stands for "none".
+pub(crate) fn album_order(item: &Item) -> (bool, u32, bool, Option<u32>) {
+    match item {
+        Item::Track(t) => (false, t.disc.unwrap_or(1), t.track.is_none(), t.track),
+        _ => (true, 0, true, None),
+    }
+}
+
 /// A list of items in `reply`, if it is one.
 fn list(reply: &Reply) -> Option<&Vec<Item>> {
     match reply {
@@ -431,5 +462,151 @@ mod tests {
             live.libraries().await,
             Err(CatalogError::NotSetUp)
         ));
+    }
+
+    /// Track `key` on `disc`, number `number`, as a catalog lists it.
+    fn on_disc(key: &str, disc: Option<u32>, number: Option<u32>) -> Item {
+        match crate::test_support::track(key, "31", 1) {
+            Item::Track(t) => Item::Track(spoolframe_types::Track {
+                disc,
+                track: number,
+                ..t
+            }),
+            _ => unreachable!(),
+        }
+    }
+
+    fn keys(items: &[Item]) -> Vec<String> {
+        items.iter().map(|i| i.id().key().to_owned()).collect()
+    }
+
+    fn album_of(children: Vec<Item>) -> ItemWithChildren {
+        ItemWithChildren {
+            item: crate::test_support::album("31"),
+            children,
+            external_ids: Vec::new(),
+            markers: Vec::new(),
+        }
+    }
+
+    /// An album whose catalog lists its discs interleaved plays disc 1,
+    /// then disc 2, each by track number.
+    #[test]
+    fn interleaved_discs_play_in_disc_order() {
+        let mut found = album_of(vec![
+            on_disc("a", Some(1), Some(2)),
+            on_disc("b", Some(2), Some(1)),
+            on_disc("c", Some(1), Some(1)),
+            on_disc("d", Some(2), Some(2)),
+        ]);
+        in_album_order(&mut found);
+        assert_eq!(keys(&found.children), ["c", "a", "b", "d"]);
+    }
+
+    /// Tracks with no disc count as disc 1, beside the tagged ones; a
+    /// track with no number comes last on its disc, ties in the
+    /// catalog's order.
+    #[test]
+    fn untagged_tracks_sort_with_disc_one() {
+        let mut found = album_of(vec![
+            on_disc("a", None, Some(3)),
+            on_disc("b", Some(1), Some(1)),
+            on_disc("c", None, None),
+            on_disc("d", Some(2), Some(1)),
+            on_disc("e", None, Some(2)),
+            on_disc("f", Some(1), None),
+        ]);
+        in_album_order(&mut found);
+        assert_eq!(keys(&found.children), ["b", "e", "a", "c", "f", "d"]);
+    }
+
+    /// A track tagged with the largest number a tag holds still comes
+    /// before one with no number: "none" is not a number.
+    #[test]
+    fn the_largest_number_is_not_taken_for_none() {
+        let mut found = album_of(vec![
+            on_disc("none", Some(1), None),
+            on_disc("max", Some(1), Some(u32::MAX)),
+        ]);
+        in_album_order(&mut found);
+        assert_eq!(keys(&found.children), ["max", "none"]);
+    }
+
+    /// Only an album's children are reordered: a show's or a playlist's
+    /// stay as the catalog lists them.
+    #[test]
+    fn other_items_keep_their_order() {
+        let children = vec![
+            on_disc("a", Some(2), Some(1)),
+            on_disc("b", Some(1), Some(1)),
+        ];
+        let mut found = ItemWithChildren {
+            item: crate::test_support::track("x", "31", 1),
+            ..album_of(children)
+        };
+        in_album_order(&mut found);
+        assert_eq!(keys(&found.children), ["a", "b"]);
+    }
+
+    /// A paired server's catalog that lists one album's tracks with its
+    /// discs interleaved, as an older server, or its Plex, may.
+    struct Interleaved;
+
+    #[async_trait]
+    impl Catalog for Interleaved {
+        async fn libraries(&self) -> Result<Vec<Library>, CatalogError> {
+            Ok(Vec::new())
+        }
+        async fn items(
+            &self,
+            _: &LibraryId,
+            _: Page,
+        ) -> Result<spoolframe_catalog::ItemPage, CatalogError> {
+            Err(CatalogError::NotFound("items".into()))
+        }
+        async fn item(&self, _: &MediaId) -> Result<ItemWithChildren, CatalogError> {
+            Ok(album_of(vec![
+                on_disc("a", Some(1), Some(2)),
+                on_disc("b", Some(2), Some(1)),
+                on_disc("c", Some(1), Some(1)),
+                on_disc("d", None, Some(3)),
+            ]))
+        }
+        async fn external_ids(&self, _: &MediaId) -> Result<Vec<String>, CatalogError> {
+            Ok(Vec::new())
+        }
+        async fn search(&self, _: &SearchQuery) -> Result<spoolframe_catalog::Found, CatalogError> {
+            Err(CatalogError::NotFound("search".into()))
+        }
+        async fn person_items(&self, _: &PersonId) -> Result<Vec<Item>, CatalogError> {
+            Ok(Vec::new())
+        }
+        async fn media_path(&self, id: &MediaId) -> Result<PathBuf, CatalogError> {
+            Err(CatalogError::NotFound(id.to_string()))
+        }
+        async fn recently_added(&self, _: u32) -> Result<Vec<Item>, CatalogError> {
+            Ok(Vec::new())
+        }
+        async fn authorize_artwork(&self, _: &ArtworkId) -> Result<(), CatalogError> {
+            Ok(())
+        }
+        async fn artwork(&self, id: &ArtworkId) -> Result<spoolframe_catalog::Image, CatalogError> {
+            Err(CatalogError::NotFound(id.to_string()))
+        }
+    }
+
+    /// The order reaches a client: a paired server's album, fetched
+    /// through the live catalog (to show, and to play), comes back in
+    /// disc order whatever order that server sent.
+    #[tokio::test]
+    async fn the_live_catalog_serves_a_paired_server_s_album_in_disc_order() {
+        let plex = PlexCatalog::new("http://127.0.0.1:9".parse().unwrap(), None).unwrap();
+        let live = LiveCatalog::new(Some(Arc::new(Composite::single("Tower", plex))));
+        live.set_peers(Arc::new(Interleaved));
+        let fed: MediaId = "fed:album:mzxw6ytbojtg633c:plex:31".parse().unwrap();
+        let shown = live.item(&fed).await.unwrap();
+        assert_eq!(keys(&shown.children), ["c", "a", "d", "b"]);
+        let (kept, _) = live.item_kept(&fed).await.unwrap();
+        assert_eq!(keys(&kept.children), ["c", "a", "d", "b"]);
     }
 }

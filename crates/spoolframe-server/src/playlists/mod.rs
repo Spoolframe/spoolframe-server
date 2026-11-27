@@ -397,13 +397,12 @@ impl AllTracks {
         let mut seen = HashSet::new();
         tracks.retain(|t| matches!(t, Item::Track(_)) && seen.insert(t.id().clone()));
         // Stable: who may see what is filtered from this order after.
-        tracks.sort_by_cached_key(|t| match t {
+        tracks.sort_by_cached_key(|item| match item {
             Item::Track(t) => (
                 t.artist_name.as_deref().unwrap_or_default().to_lowercase(),
                 t.album_title.as_deref().unwrap_or_default().to_lowercase(),
                 t.album_id.to_string(),
-                t.disc.unwrap_or(1),
-                t.track.unwrap_or(u32::MAX),
+                crate::catalog::album_order(item),
                 t.title.to_lowercase(),
             ),
             _ => Default::default(),
@@ -2735,10 +2734,9 @@ fn tracks_of(children: Vec<Item>) -> Vec<Item> {
         .into_iter()
         .filter(|c| matches!(c, Item::Track(_)))
         .collect();
-    tracks.sort_by_key(|t| match t {
-        Item::Track(t) => (t.disc.unwrap_or(1), t.track.unwrap_or(u32::MAX)),
-        _ => (u32::MAX, u32::MAX),
-    });
+    // `Composite` gives them in this order already; a guard for the test
+    // catalogs, which list them as they like.
+    tracks.sort_by_key(crate::catalog::album_order);
     tracks
 }
 

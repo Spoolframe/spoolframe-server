@@ -511,18 +511,23 @@ impl Catalog for Composite {
         Ok(wanted.iter().filter_map(|id| found.remove(id)).collect())
     }
 
+    /// An album's tracks come in disc order (`in_album_order`), from Plex
+    /// and from a paired server alike.
     async fn item(&self, id: &MediaId) -> Result<ItemWithChildren, CatalogError> {
-        if let Some(peers) = self.federated(id.namespace(), id) {
-            return peers?.item(id).await;
-        }
-        let (server, local) = ids::media_local(id);
-        let found = self
-            .source(server, id)?
-            .catalog
-            .item(&local)
-            .await
-            .map_err(|e| named(e, &local, id))?;
-        Ok(ids::item_with_children(server, found))
+        let mut found = if let Some(peers) = self.federated(id.namespace(), id) {
+            peers?.item(id).await?
+        } else {
+            let (server, local) = ids::media_local(id);
+            let found = self
+                .source(server, id)?
+                .catalog
+                .item(&local)
+                .await
+                .map_err(|e| named(e, &local, id))?;
+            ids::item_with_children(server, found)
+        };
+        super::in_album_order(&mut found);
+        Ok(found)
     }
 
     async fn episodes(&self, show: &MediaId) -> Result<Vec<Item>, CatalogError> {
@@ -594,7 +599,9 @@ impl Catalog for Composite {
     /// other is here when Plex finds it.
     async fn item_kept(&self, id: &MediaId) -> Result<(ItemWithChildren, Reach), CatalogError> {
         if let Some(peers) = self.federated(id.namespace(), id) {
-            return peers?.item_kept(id).await;
+            let (mut found, reach) = peers?.item_kept(id).await?;
+            super::in_album_order(&mut found);
+            return Ok((found, reach));
         }
         Ok((self.item(id).await?, Reach::Here))
     }
@@ -852,7 +859,11 @@ impl Inspect for Composite {
             .child_rows(&local)
             .await
             .map_err(|e| named(e, &local, id))?;
-        Ok(rows(server, found))
+        let mut rows = rows(server, found);
+        if id.kind() == MediaKind::Album {
+            super::sort_rows(&mut rows);
+        }
+        Ok(rows)
     }
 
     /// A paired server's item (P8-02) as its cache has it: no files, no
@@ -861,7 +872,8 @@ impl Inspect for Composite {
     async fn inspect(&self, id: &MediaId) -> Result<Inspected, CatalogError> {
         if let Some(peers) = self.federated(id.namespace(), id) {
             let peers = peers?;
-            let found = peers.item(id).await?;
+            // Sorted by `item`, so the rows below agree.
+            let found = self.item(id).await?;
             let children = found
                 .children
                 .iter()
@@ -895,15 +907,21 @@ impl Inspect for Composite {
             .inspect(&local)
             .await
             .map_err(|e| named(e, &local, id))?;
+        let mut found = ids::item_with_children(server, seen.found);
+        let mut children = rows(server, seen.children);
+        if matches!(found.item, Item::Album(_)) {
+            super::in_album_order(&mut found);
+            super::sort_rows(&mut children);
+        }
         Ok(Inspected {
-            found: ids::item_with_children(server, seen.found),
+            found,
             library: seen.library.map(|l| ids::library(server, l)),
             ancestors: seen
                 .ancestors
                 .into_iter()
                 .map(|(id, title)| (ids::media(server, id), title))
                 .collect(),
-            children: rows(server, seen.children),
+            children,
             ..seen
         })
     }
