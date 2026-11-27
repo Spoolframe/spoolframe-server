@@ -17,7 +17,7 @@
   1, one with no number goes last on its disc. The admin catalog's item
   page and child rows show the same order.
 
-## 0.18.0
+## 0.18.0 (2026-11-27)
 
 - Changed, server and SDK: iroh 1.5 (noq 1.5). Its QUIC state machine,
   noq-proto 1.5.0, has the stream-assembler fix (noq#866) on crates.io,
