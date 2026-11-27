@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.18.1
+
+- Added, SDK and FFI: `SignInOffer::takes_another_round()` (and
+  `SpoolSignInOffer.takes_another_round()`): whether the TV still waits
+  for a round from this phone, for "Try again". Apps no longer copy the
+  SDK's rule (a server not signed in, and not turned down on the TV),
+  which also missed a TV that had hung up. `finish()` during a round
+  in flight now holds once that round ends, and an `approve` of only
+  servers already signed in finishes rather than leaving the TV
+  waiting two minutes.
+
 ## 0.18.0
 
 - Changed, server and SDK: iroh 1.5 (noq 1.5). Its QUIC state machine,

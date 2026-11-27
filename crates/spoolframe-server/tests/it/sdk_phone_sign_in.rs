@@ -132,6 +132,8 @@ async fn a_tv_is_signed_in_to_the_servers_picked_on_the_phone() {
     });
     let (results, signed) = (results.unwrap(), signed.unwrap());
     assert_eq!(results.len(), 2);
+    // Every server signed in: the TV takes no other round.
+    assert!(!offer.takes_another_round().await);
     for result in &results {
         assert!(
             matches!(result.outcome, SignInOfferOutcome::SignedIn),
@@ -384,6 +386,9 @@ async fn a_server_retried_after_failing_on_the_tv_counts_once() {
         .map(|r| r.endpoint_id.clone())
         .collect();
     assert_eq!(failed, std::slice::from_ref(&late), "{results:?}");
+    // The TV said one did not sign in: it waits for another round, the
+    // phone's "Try again".
+    assert!(offer.takes_another_round().await);
 
     // Again, that one alone: "Confirm it's you" first if it asks.
     let again: Vec<_> = choices
@@ -406,6 +411,7 @@ async fn a_server_retried_after_failing_on_the_tv_counts_once() {
         "{retried:?}"
     );
     offer.finish().await;
+    assert!(!offer.takes_another_round().await);
 
     let mut latest = std::collections::BTreeMap::new();
     while let Some(done) = progress.next().await {
@@ -688,6 +694,8 @@ async fn a_sign_in_turned_down_on_the_tv_keeps_nothing() {
             ),
             "{results:?}"
         );
+        // Turned down on the TV: no other round.
+        assert!(!offer.takes_another_round().await);
         assert!(tv.servers().await.unwrap().is_empty());
         assert!(
             tv.saved_profiles(&id(&servers[0]))
@@ -1052,6 +1060,75 @@ async fn a_server_that_signs_the_phone_out_while_another_is_asked_is_listed_ende
     assert_eq!(state(&servers[0]), [true], "{choices:?}");
     assert_eq!(state(&servers[1]), [false], "{choices:?}");
     offer.decline().await.unwrap();
+    tv.close().await;
+    phone.close().await;
+    stop(servers).await;
+}
+
+/// `finish()` while a round is still waiting for the TV: the round ends
+/// with a server not signed in, which would keep the TV waiting, but the
+/// phone said it was done, so no other round is taken and the TV is
+/// told.
+#[tokio::test]
+async fn finishing_while_a_round_is_in_flight_takes_no_other_round() {
+    let servers = servers("sdk-psi-finish-mid", 2).await;
+    let phone = phone(&servers).await;
+    let tv = new_client("tv", Platform::Tvos).await;
+    let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+    let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
+    let choices = offer.servers().await.unwrap();
+    let (results, ()) = tokio::join!(offer.approve(&choices, false), async {
+        let held = held(&shown).await;
+        // The round is in flight: the phone waits for the TV's answer.
+        offer.finish().await;
+        // One grant runs out before the TV redeems it.
+        servers[1]
+            .clock
+            .advance(std::time::Duration::from_secs(10 * 60));
+        held.confirm().await.unwrap();
+    });
+    let results = results.unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|r| r.outcome != SignInOfferOutcome::SignedIn),
+        "{results:?}"
+    );
+    assert!(!offer.takes_another_round().await);
+    tv.close().await;
+    phone.close().await;
+    stop(servers).await;
+}
+
+/// A round signs in one server and fails the other; the person unticks
+/// the failed one and approves the rest. Nothing is left to send and
+/// nothing failed, so the TV is told the phone is done rather than left
+/// waiting two minutes.
+#[tokio::test]
+async fn approving_only_servers_signed_in_already_ends_the_rounds() {
+    let servers = servers("sdk-psi-untick", 2).await;
+    let phone = phone(&servers).await;
+    let tv = new_client("tv", Platform::Tvos).await;
+    let shown = tv.start_phone_sign_in("TV", false).await.unwrap();
+    let offer = phone.scan_phone_sign_in(shown.link()).await.unwrap();
+    let choices = offer.servers().await.unwrap();
+    let late = id(&servers[1]);
+    let (results, ()) = tokio::join!(offer.approve(&choices, false), async {
+        let held = held(&shown).await;
+        servers[1]
+            .clock
+            .advance(std::time::Duration::from_secs(10 * 60));
+        held.confirm().await.unwrap();
+    });
+    let results = results.unwrap();
+    assert!(offer.takes_another_round().await, "{results:?}");
+    let kept: Vec<_> = choices
+        .into_iter()
+        .filter(|c| c.server.endpoint_id != late)
+        .collect();
+    let again = offer.approve(&kept, false).await.unwrap();
+    assert_eq!(again[0].outcome, SignInOfferOutcome::SignedIn);
+    assert!(!offer.takes_another_round().await);
     tv.close().await;
     phone.close().await;
     stop(servers).await;

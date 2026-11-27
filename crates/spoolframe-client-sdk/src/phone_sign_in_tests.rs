@@ -83,7 +83,10 @@ async fn the_phone_learns_what_the_tv_is() {
         // A phone with no servers has no one to sign the TV in as.
         assert!(offer.servers().await.unwrap().is_empty());
         assert!(matches!(offer.send().await, Err(SdkError::InvalidInput(_))));
+        // The TV waits for the first round, until the phone declines.
+        assert!(offer.takes_another_round().await);
         offer.decline().await.unwrap();
+        assert!(!offer.takes_another_round().await);
         assert_eq!(pairing_error(shown.wait().await), PairingError::Declined);
     })
     .await;

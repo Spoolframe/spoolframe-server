@@ -240,7 +240,7 @@ impl Client {
                 client: self.clone(),
                 offers: tokio::sync::Mutex::new(Vec::new()),
                 signed_in: Default::default(),
-                streams: tokio::sync::Mutex::new(Some(Streams { conn, send, recv })),
+                round: tokio::sync::Mutex::new(Round::Open(Streams { conn, send, recv })),
             }),
             TvFrame::Refused { reason } => {
                 conn.close(0u32.into(), b"refused");
@@ -937,7 +937,29 @@ pub struct SignInOffer {
     /// The profiles the TV said it signed in to in an earlier round:
     /// never offered again, so no second session is made for them.
     signed_in: parking_lot::Mutex<std::collections::HashSet<ProfileKey>>,
-    streams: tokio::sync::Mutex<Option<Streams>>,
+    round: tokio::sync::Mutex<Round>,
+}
+
+/// Where a [`SignInOffer`]'s exchange with the TV is.
+enum Round {
+    /// The TV waits for a round from this phone.
+    Open(Streams),
+    /// A round is sent and its answer awaited; the round holds the
+    /// streams, and puts them back only if it still finds this.
+    InFlight,
+    /// Answered, declined or finished: nothing more is sent.
+    Done,
+}
+
+impl Round {
+    /// Why nothing can be sent now.
+    fn closed(&self) -> SdkError {
+        let why = match self {
+            Round::InFlight => "a round is still waiting for the TV",
+            Round::Open(_) | Round::Done => "already answered",
+        };
+        PairingError::Aborted(why.into()).into()
+    }
 }
 
 impl std::fmt::Debug for SignInOffer {
@@ -954,7 +976,7 @@ impl std::fmt::Debug for SignInOffer {
 /// than leaving it waiting for the connection to time out.
 impl Drop for SignInOffer {
     fn drop(&mut self) {
-        if let Some(streams) = self.streams.get_mut().take() {
+        if let Round::Open(streams) = std::mem::replace(self.round.get_mut(), Round::Done) {
             streams.conn.close(0u32.into(), b"gone");
         }
     }
@@ -1055,10 +1077,10 @@ impl SignInOffer {
 
     /// [`SdkError::Pairing`] once answered: nothing more can be sent.
     async fn check_open(&self) -> Result<(), SdkError> {
-        if self.streams.lock().await.is_none() {
-            return Err(PairingError::Aborted("already answered".into()).into());
+        match &*self.round.lock().await {
+            Round::Open(_) => Ok(()),
+            other => Err(other.closed()),
         }
-        Ok(())
     }
 
     /// Ask `choice`'s server for the TV's sign-in. One whose session has
@@ -1098,10 +1120,30 @@ impl SignInOffer {
             .collect())
     }
 
+    /// Whether the TV still waits for a round from this phone: before the
+    /// first [`SignInOffer::send`] (or [`SignInOffer::approve`]), and after
+    /// one that left a server not signed in, until
+    /// [`SignInOffer::finish`]. False once every server signed in
+    /// (including an [`SignInOffer::approve`] of only servers signed in
+    /// already), once the person at the TV turned it down, after
+    /// [`SignInOffer::decline`], after [`SignInOffer::finish`] even with a
+    /// round in flight, and once the TV has hung up (it waits two minutes
+    /// for a round). An app shows "Try again" while it is true,
+    /// rather than working the rule out from the results.
+    pub async fn takes_another_round(&self) -> bool {
+        matches!(
+            &*self.round.lock().await,
+            Round::Open(streams) if streams.conn.close_reason().is_none()
+        )
+    }
+
     /// Tell the TV this phone offers no more: it stops waiting for
-    /// another round. Dropping the offer does the same.
+    /// another round. Dropping the offer does the same. A round still in
+    /// flight finishes, and then the TV is told.
     pub async fn finish(&self) {
-        if let Some(streams) = self.streams.lock().await.take() {
+        // A round in flight finds Done when it ends, and closes then.
+        let was = std::mem::replace(&mut *self.round.lock().await, Round::Done);
+        if let Round::Open(streams) = was {
             streams.conn.close(0u32.into(), b"done");
         }
     }
@@ -1119,14 +1161,65 @@ impl SignInOffer {
                 "no server to sign the TV in to".into(),
             ));
         }
-        let Some(Streams {
+        let streams = {
+            let mut round = self.round.lock().await;
+            match std::mem::replace(&mut *round, Round::InFlight) {
+                Round::Open(streams) => streams,
+                other => {
+                    let closed = other.closed();
+                    *round = other;
+                    return Err(closed);
+                }
+            }
+        };
+        let exchanged = self.exchange(made, streams, more).await;
+        let mut round = self.round.lock().await;
+        let (done, kept) = match exchanged {
+            Ok(exchanged) => exchanged,
+            Err(e) => {
+                if matches!(*round, Round::InFlight) {
+                    *round = Round::Done;
+                }
+                return Err(e);
+            }
+        };
+        match (kept, &*round) {
+            // The TV waits for another round, and nothing finished this
+            // meanwhile.
+            (Some(streams), Round::InFlight) => *round = Round::Open(streams),
+            (kept, _) => {
+                if let Some(streams) = kept {
+                    streams.conn.close(0u32.into(), b"done");
+                }
+                *round = Round::Done;
+            }
+        }
+        drop(round);
+        tracing::info!(
+            device = %self.device.fmt_short(),
+            signed_in = done
+                .iter()
+                .filter(|(_, r)| matches!(r.outcome, SignInOfferOutcome::SignedIn))
+                .count(),
+            "signed a TV in"
+        );
+        Ok(done)
+    }
+
+    /// One round with the TV: `made` sent on `streams`, and how each
+    /// went; with the streams back if the TV waits for another round
+    /// (`more` may follow, or one failed, and none was turned down),
+    /// else closed.
+    async fn exchange(
+        &self,
+        made: Vec<Made>,
+        Streams {
             conn,
             mut send,
             mut recv,
-        }) = self.streams.lock().await.take()
-        else {
-            return Err(PairingError::Aborted("already answered".into()).into());
-        };
+        }: Streams,
+        more: bool,
+    ) -> Result<(Vec<(ProfileKey, SignInOfferResult)>, Option<Streams>), SdkError> {
         let cut = |e: String| SdkError::from(PairingError::Aborted(e));
         let offers = made.iter().map(|m| m.offer.clone()).collect();
         write_frame(&mut send, &PhoneFrame::Offers { offers })
@@ -1196,29 +1289,22 @@ impl SignInOffer {
             .iter()
             .any(|(_, r)| matches!(r.outcome, SignInOfferOutcome::Failed(_)));
         if (more || failed) && !declined {
-            // The TV waits for another round.
-            *self.streams.lock().await = Some(Streams { conn, send, recv });
+            Ok((done, Some(Streams { conn, send, recv })))
         } else {
             conn.close(0u32.into(), b"done");
+            Ok((done, None))
         }
-        tracing::info!(
-            device = %self.device.fmt_short(),
-            signed_in = done
-                .iter()
-                .filter(|(_, r)| matches!(r.outcome, SignInOfferOutcome::SignedIn))
-                .count(),
-            "signed a TV in"
-        );
-        Ok(done)
     }
 
     /// [`SignInOffer::offer`] each of `chosen`, all at once, then
     /// [`SignInOffer::send`]: how each went, in `chosen`'s order. One the
     /// phone could not offer is [`SignInOfferOutcome::NotOffered`] and
     /// stops none of the rest: [`SignInFailure::SessionEnded`] for one
-    /// whose session has ended, before or during this call. If none could be offered nothing is sent,
-    /// and the TV still waits: confirm it is them where the server asked,
-    /// and approve again.
+    /// whose session has ended, before or during this call. If none could
+    /// be offered nothing is sent, and the TV still waits: confirm it is
+    /// them where the server asked, and approve again. If every one chosen
+    /// is signed in already, from an earlier round, nothing is sent and the
+    /// TV is told this phone is done, as [`SignInOffer::finish`] does.
     pub async fn approve(
         &self,
         chosen: &[SignInChoice],
@@ -1234,7 +1320,11 @@ impl SignInOffer {
         let mut not_offered: std::collections::HashMap<ProfileKey, SignInFailure> =
             std::collections::HashMap::new();
         let mut sent = Vec::new();
-        if !to_make.is_empty() {
+        if to_make.is_empty() && !chosen.is_empty() {
+            // Every one chosen is signed in already: nothing to send and
+            // nothing failed, so the TV need not wait for another round.
+            self.finish().await;
+        } else if !to_make.is_empty() {
             self.check_open().await?;
             // One whose session has ended is not tried.
             let (ended, live): (Vec<&SignInChoice>, Vec<&SignInChoice>) =
@@ -1286,8 +1376,16 @@ impl SignInOffer {
     /// only.
     pub async fn decline(&self) -> Result<(), SdkError> {
         self.offers.lock().await.clear();
-        let Some(Streams { conn, mut send, .. }) = self.streams.lock().await.take() else {
-            return Err(PairingError::Aborted("already answered".into()).into());
+        let Streams { conn, mut send, .. } = {
+            let mut round = self.round.lock().await;
+            match std::mem::replace(&mut *round, Round::Done) {
+                Round::Open(streams) => streams,
+                other => {
+                    let closed = other.closed();
+                    *round = other;
+                    return Err(closed);
+                }
+            }
         };
         let sent = write_frame(&mut send, &PhoneFrame::Declined).await;
         finish_and_wait_closed(&conn, &mut send).await;

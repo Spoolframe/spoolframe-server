@@ -362,6 +362,16 @@ impl SpoolSignInOffer {
         Ok(results.into_iter().map(Into::into).collect())
     }
 
+    /// Whether the TV still waits for a round from this phone: show "Try
+    /// again" while it does. True before the first `send` or `approve` and
+    /// after one that left a server not signed in; false once all signed
+    /// in, after a decline on either side, after `finish`, and once the TV
+    /// has hung up.
+    pub async fn takes_another_round(&self) -> bool {
+        let offer = self.0.clone();
+        run(async move { offer.takes_another_round().await }).await
+    }
+
     pub async fn decline(&self) -> Result<(), SpoolError> {
         let offer = self.0.clone();
         Ok(run(async move { offer.decline().await }).await?)
@@ -372,12 +382,7 @@ impl SpoolSignInOffer {
     /// was not signed in, the TV otherwise waits two minutes for a retry.
     pub async fn finish(&self) {
         let offer = self.0.clone();
-        run(async move {
-            offer.finish().await;
-            Ok::<_, sdk::SdkError>(())
-        })
-        .await
-        .ok();
+        run(async move { offer.finish().await }).await;
     }
 }
 

@@ -843,6 +843,14 @@ Phone side:
   remember)` does both: a server that refuses is
   `SignInOfferOutcome::NotOffered(failure)`, and with none offered
   nothing is sent and the TV keeps waiting. `decline()` tells the TV no.
+  `takes_another_round()` says whether the TV still waits for a round
+  from this phone (since 0.18.1): true before the first and after one
+  that left a server not signed in, false once all signed in, after a
+  decline on either side, after `finish()` (even called while a round
+  was in flight: that round then tells the TV the phone is done), and
+  once the TV has hung up. An `approve` of only servers the TV signed
+  in to in an earlier round sends nothing and finishes, so it reads
+  false after. An app shows "Try again" by it.
 - A `SessionEnded` choice is not tried: `offer` is
   `SdkError::SignInRequired`, and `approve` gives it
   `NotOffered(SignInFailure::SessionEnded)`. A session that ends after
